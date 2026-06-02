@@ -93,28 +93,13 @@ def run_command(cmd, cwd=None):
 
 
 def get_repo_root():
-    """Find the repo root by looking for the environments folder."""
-    # Check if TERRAFORM_REPO env var is set
-    env_repo = os.environ.get("TERRAFORM_REPO")
-    if env_repo:
-        path = Path(env_repo).resolve()
-        if (path / "environments").exists():
-            return path
-
-    # Try common locations
-    candidates = [
-        Path.home() / "Github-Personal" / "azure-paas-test",
-        Path.home() / "azure-paas-test",
-        Path.cwd(),
-    ]
-    for path in candidates:
-        if (path / "environments").exists() and (path / "_template").exists():
-            return path
-
-    print_error("Could not find Terraform repo with environments/ and _template/ folders.")
-    print("  Set the TERRAFORM_REPO environment variable to the repo path:")
-    print("  export TERRAFORM_REPO=~/Github-Personal/azure-paas-test")
-    sys.exit(1)
+    """Use the directory where paas-deployer.py lives as the repo root."""
+    root = Path(__file__).parent.resolve()
+    if not (root / "environments").exists() or not (root / "_template").exists():
+        print_error("Could not find environments/ and _template/ folders.")
+        print("  Make sure paas-deployer.py is in the root of the repo.")
+        sys.exit(1)
+    return root
 
 
 def get_az_account():
@@ -728,6 +713,89 @@ def print_summary(data):
     """)
 
 
+
+def post_merge_deploy(repo_root, server_name, environment, action):
+    """After PR merge, pull and run terraform."""
+    if action == "delete":
+        print("\n  After PR is merged, remember to:")
+        print(f"    1. Remove the Azure resource lock for {server_name}")
+        print(f"    2. cd environments/{environment}/{server_name}")
+        print(f"    3. export TF_VAR_pg_admin_password=\'YourPassword\'")
+        print(f"    4. terraform destroy -var-file=\"terraform.tfvars\"")
+        return
+
+    if not confirm("Have you merged the PR?", default="n"):
+        print("\n  Run terraform manually when ready:")
+        print(f"    cd environments/{environment}/{server_name}")
+        print(f"    export TF_VAR_pg_admin_password=\'YourPassword\'")
+        if action == "create":
+            print(f"    terraform init")
+        print(f"    terraform apply -var-file=\"terraform.tfvars\"")
+        return
+
+    print_step("Pulling merged changes from main...")
+    ok, _, err = run_command("git checkout main", cwd=repo_root)
+    if not ok:
+        print_error(f"Failed to checkout main: {err}")
+        return
+    ok, _, err = run_command("git pull origin main", cwd=repo_root)
+    if not ok:
+        print_error(f"Failed to pull: {err}")
+        return
+    print_success("Up to date with main.")
+
+    server_path = repo_root / "environments" / environment / server_name
+
+    # Set admin password
+    print("\n  Admin password is required for Terraform.")
+    print("  This will NOT be stored anywhere.")
+    import getpass
+    password = getpass.getpass("  Enter pg_admin_password: ")
+    env = os.environ.copy()
+    env["TF_VAR_pg_admin_password"] = password
+
+    if action == "create":
+        print_step("Running terraform init...")
+        result = subprocess.run("terraform init", shell=True, cwd=server_path, env=env)
+        if result.returncode != 0:
+            print_error("terraform init failed.")
+            return
+
+    print_step("Running terraform plan...")
+    result = subprocess.run(
+        f'terraform plan -var-file="terraform.tfvars"',
+        shell=True, cwd=server_path, env=env
+    )
+    if result.returncode != 0:
+        print_error("terraform plan failed.")
+        return
+
+    if not confirm("Plan looks good. Apply?", default="n"):
+        print("\n  Apply cancelled. Run manually when ready:")
+        print(f"    cd environments/{environment}/{server_name}")
+        print(f"    terraform apply -var-file=\"terraform.tfvars\"")
+        return
+
+    print_step("Running terraform apply...")
+    result = subprocess.run(
+        f'terraform apply -var-file="terraform.tfvars"',
+        shell=True, cwd=server_path, env=env
+    )
+    if result.returncode != 0:
+        print_error("terraform apply failed.")
+        return
+
+    print_success("Deployment complete!")
+    if action == "create":
+        print("\n  Don\'t forget to add the Azure resource lock:")
+        print(f"    az lock create \\")
+        print(f"      --name lock-{server_name} \\")
+        print(f"      --resource-group <your-rg> \\")
+        print(f"      --resource-type Microsoft.DBforPostgreSQL/flexibleServers \\")
+        print(f"      --resource {server_name} \\")
+        print(f"      --lock-type CanNotDelete")
+
+
 # ===========================================================================
 # FLOWS
 # ===========================================================================
@@ -772,6 +840,7 @@ def create_server(repo_root, repo_slug):
 
     git_commit_and_push(repo_root, branch_name, f"Add {server_name} PostgreSQL server")
     print_next_steps(repo_slug, branch_name, server_name, environment, "create")
+    post_merge_deploy(repo_root, server_name, environment, "create")
 
 
 def modify_server(repo_root, repo_slug):
@@ -868,6 +937,7 @@ def modify_server(repo_root, repo_slug):
 
     git_commit_and_push(repo_root, branch_name, f"Modify {name} PostgreSQL server")
     print_next_steps(repo_slug, branch_name, name, env, "modify")
+    post_merge_deploy(repo_root, name, env, "modify")
 
 
 def delete_server(repo_root, repo_slug):
@@ -911,6 +981,7 @@ def delete_server(repo_root, repo_slug):
 
     git_commit_and_push(repo_root, branch_name, f"Remove {name} PostgreSQL server")
     print_next_steps(repo_slug, branch_name, name, env, "delete")
+    post_merge_deploy(repo_root, name, env, "delete")
 
 
 # ===========================================================================
