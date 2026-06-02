@@ -1,0 +1,125 @@
+# ===========================================================================
+# terraform.tfvars — PostgreSQL Flexible Server
+#
+# INSTRUCTIONS:
+#   1. Copy the entire _template folder and rename to your server name:
+#        cp -r _template environments/dta/psql-myapp-dta-001
+#
+#   2. Update 00_global.tf — change the backend key to match your server name:
+#        key = "dta/psql-myapp-dta-001.tfstate"
+#
+#   3. Copy and fill in this file:
+#        cp terraform.tfvars.example terraform.tfvars
+#
+#   4. Set the admin password as an environment variable (never put in this file):
+#        export TF_VAR_pg_admin_password="YourSecureP@ssword123!"
+#
+#   5. Deploy:
+#        terraform init
+#        terraform plan -var-file="terraform.tfvars"
+#        terraform apply -var-file="terraform.tfvars"
+#
+#   6. To modify this server in future:
+#        cd environments/dta/psql-myapp-dta-001
+#        nano terraform.tfvars        # make your changes
+#        terraform plan -var-file="terraform.tfvars"
+#        terraform apply -var-file="terraform.tfvars"
+#
+#   7. To destroy:
+#        terraform destroy -var-file="terraform.tfvars"
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# IDENTITY & ENVIRONMENT
+# ---------------------------------------------------------------------------
+subscription_id = "<REQUIRED: Azure Subscription ID>"
+tenant_id       = "<REQUIRED: Azure Tenant ID>"
+environment     = "<REQUIRED: dta or prod>"
+project         = "<REQUIRED: your project name e.g. myapp>"
+
+# ---------------------------------------------------------------------------
+# RESOURCE GROUP  (must already exist)
+# ---------------------------------------------------------------------------
+pg_resource_group_name = "<REQUIRED: e.g. rg-myapp-dta>"
+
+# ---------------------------------------------------------------------------
+# NETWORKING  (pre-existing, managed by networking team)
+# ---------------------------------------------------------------------------
+vnet_name                            = "<REQUIRED: e.g. vnet-shared-dta>"
+vnet_resource_group_name             = "<REQUIRED: e.g. rg-network-dta>"
+pe_subnet_name                       = "<REQUIRED: e.g. snet-private-endpoints>"
+private_dns_zone_name                = "privatelink.postgres.database.azure.com"
+private_dns_zone_resource_group_name = "<REQUIRED: e.g. rg-network-dta>"
+
+# ---------------------------------------------------------------------------
+# POSTGRESQL SERVER
+# pg_server_name must be globally unique across all of Azure.
+# Recommended format: psql-<project>-<env>-<sequence>
+# ---------------------------------------------------------------------------
+pg_server_name = "<REQUIRED: e.g. psql-myapp-dta-001>"
+pg_version     = 16
+
+# SKU — vCPU and memory (see modules/postgresql/variables.tf for full list)
+# Burstable    (dev/test): B_Standard_B1ms, B_Standard_B2ms, B_Standard_B4ms
+# General Purpose  (prod): GP_Standard_D2ds_v5, GP_Standard_D4ds_v5, GP_Standard_D8ds_v5
+# Memory Optimized (prod): MO_Standard_E2ds_v5, MO_Standard_E4ds_v5, MO_Standard_E8ds_v5
+pg_sku_name = "GP_Standard_D2ds_v5"
+
+# Storage — disk size (see modules/postgresql/variables.tf for full list)
+# 32768=32GB, 65536=64GB, 131072=128GB, 262144=256GB, 524288=512GB, 1048576=1TB
+pg_storage_mb        = 32768
+pg_storage_tier      = null    # null = Azure auto-selects based on storage size
+pg_auto_grow_enabled = false   # set true for production
+
+# Availability zone (1, 2, or 3)
+pg_zone = 1
+
+# ---------------------------------------------------------------------------
+# ADMINISTRATOR CREDENTIALS
+# Do NOT set pg_admin_password here.
+# Set it via: export TF_VAR_pg_admin_password="YourPassword123!"
+# ---------------------------------------------------------------------------
+pg_admin_login = "psqladmin"
+
+# ---------------------------------------------------------------------------
+# BACKUP
+# ---------------------------------------------------------------------------
+pg_backup_retention_days        = 7      # 7–35 days
+pg_geo_redundant_backup_enabled = false  # set true for prod
+
+# ---------------------------------------------------------------------------
+# MAINTENANCE WINDOW  (UTC)
+# day_of_week: 0=Sunday, 1=Monday, 2=Tuesday, 3=Wednesday,
+#              4=Thursday, 5=Friday, 6=Saturday
+# start_minute: 0 or 30 only
+# ---------------------------------------------------------------------------
+pg_maintenance_window = {
+  day_of_week  = 0   # Sunday
+  start_hour   = 2   # 02:00 UTC
+  start_minute = 0
+}
+
+# ---------------------------------------------------------------------------
+# HIGH AVAILABILITY
+# Disable for dta. Enable for prod.
+# pg_ha_standby_zone must differ from pg_zone.
+# ---------------------------------------------------------------------------
+pg_ha_enabled      = false
+pg_ha_standby_zone = 2
+
+# ---------------------------------------------------------------------------
+# DATABASES  (logical databases created on this server)
+# ---------------------------------------------------------------------------
+pg_databases = {
+  appdb = {
+    name      = "appdb"
+    charset   = "UTF8"
+    collation = "en_US.utf8"
+  }
+  # Add more databases as needed:
+  # reporting = {
+  #   name      = "reporting"
+  #   charset   = "UTF8"
+  #   collation = "en_US.utf8"
+  # }
+}

@@ -1,7 +1,6 @@
-cat > ~/Github-Personal/azure-paas-test/pg_manager.py << 'ENDOFFILE'
 #!/usr/bin/env python3
 """
-pg_manager.py — PostgreSQL Flexible Server Manager
+paas-deployer.py — PostgreSQL Flexible Server Manager
 Automates branch creation, tfvars generation, and GitHub PR workflow.
 """
 
@@ -9,6 +8,7 @@ import os
 import re
 import sys
 import json
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -52,15 +52,19 @@ STORAGE_OPTIONS = [
     (4194304, "  4 TB"),
 ]
 
-PG_VERSIONS     = [14, 15, 16, 17]
-ZONES           = [1, 2, 3]
-ENVIRONMENTS    = ["dta", "prod"]
-DAYS_OF_WEEK    = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
-START_MINUTES   = [0, 30]
+PG_VERSIONS  = [14, 15, 16, 17]
+ZONES        = [1, 2, 3]
+ENVIRONMENTS = ["dta", "prod"]
+DAYS_OF_WEEK = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
+START_MINUTES = [0, 30]
 
 # ===========================================================================
 # HELPERS
 # ===========================================================================
+
+def clear_screen():
+    os.system("cls" if os.name == "nt" else "clear")
+
 
 def print_header(title):
     print("\n" + "=" * 60)
@@ -69,35 +73,51 @@ def print_header(title):
 
 
 def print_step(msg):
-    print(f"\n  → {msg}")
+    print(f"\n  -> {msg}")
 
 
 def print_success(msg):
-    print(f"  ✓ {msg}")
+    print(f"  [OK] {msg}")
 
 
 def print_error(msg):
-    print(f"  ✗ {msg}")
+    print(f"  [ERROR] {msg}")
 
 
-def run_command(cmd, cwd=None, capture=True):
-    """Run a shell command and return (success, output)."""
+def run_command(cmd, cwd=None):
     result = subprocess.run(
         cmd, shell=True, cwd=cwd,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
     )
-    if capture:
-        return result.returncode == 0, result.stdout.strip(), result.stderr.strip()
-    return result.returncode == 0, "", ""
+    return result.returncode == 0, result.stdout.strip(), result.stderr.strip()
 
 
 def get_repo_root():
-    """Return the root directory of the repo."""
-    return Path(__file__).parent.resolve()
+    """Find the repo root by looking for the environments folder."""
+    # Check if TERRAFORM_REPO env var is set
+    env_repo = os.environ.get("TERRAFORM_REPO")
+    if env_repo:
+        path = Path(env_repo).resolve()
+        if (path / "environments").exists():
+            return path
+
+    # Try common locations
+    candidates = [
+        Path.home() / "Github-Personal" / "azure-paas-test",
+        Path.home() / "azure-paas-test",
+        Path.cwd(),
+    ]
+    for path in candidates:
+        if (path / "environments").exists() and (path / "_template").exists():
+            return path
+
+    print_error("Could not find Terraform repo with environments/ and _template/ folders.")
+    print("  Set the TERRAFORM_REPO environment variable to the repo path:")
+    print("  export TERRAFORM_REPO=~/Github-Personal/azure-paas-test")
+    sys.exit(1)
 
 
 def get_az_account():
-    """Read subscription and tenant ID from az account show."""
     print_step("Reading Azure account details...")
     ok, out, err = run_command("az account show --output json")
     if not ok:
@@ -112,30 +132,45 @@ def get_az_account():
 
 
 def get_github_remote(repo_root):
-    """Get the GitHub remote URL and derive the repo path."""
     ok, out, _ = run_command("git remote get-url origin", cwd=repo_root)
     if not ok or not out:
         print_error("Could not determine GitHub remote URL.")
         sys.exit(1)
-    # Handle both SSH and HTTPS formats
-    # git@github.com:user/repo.git  or  https://github.com/user/repo.git
     match = re.search(r'[:/]([^:/]+/[^/]+?)(?:\.git)?$', out)
     if not match:
         print_error(f"Could not parse remote URL: {out}")
         sys.exit(1)
-    return match.group(1)  # e.g. sivaraam73/azure-paas-test
+    return match.group(1)
+
+
+def get_storage_account(repo_root):
+    for env_dir in (repo_root / "environments").iterdir():
+        if not env_dir.is_dir():
+            continue
+        for server_dir in env_dir.iterdir():
+            tf = server_dir / "00_global.tf"
+            if tf.exists():
+                m = re.search(r'storage_account_name\s*=\s*"([^"]+)"', tf.read_text())
+                if m:
+                    return m.group(1)
+    tf = repo_root / "_template" / "00_global.tf"
+    if tf.exists():
+        m = re.search(r'storage_account_name\s*=\s*"([^"]+)"', tf.read_text())
+        if m:
+            return m.group(1)
+    return "stttfstatesiva001"
 
 
 def validate_input(prompt, pattern, example, error_msg, default=None, min_len=1, max_len=100):
-    """Prompt until input matches pattern."""
     default_hint = f" (default={default})" if default is not None else ""
-    print(f"\n  Format  : {error_msg}")
+    print(f"\n  {prompt}")
+    print(f"  Format  : {error_msg}")
     print(f"  Example : {example}")
     while True:
         value = input(f"  Enter value{default_hint}: ").strip()
         if value == "" and default is not None:
             print_success(f"Using default: {default}")
-            return default
+            return str(default)
         if value == "":
             print_error("Cannot be empty.")
             continue
@@ -143,14 +178,13 @@ def validate_input(prompt, pattern, example, error_msg, default=None, min_len=1,
             print_error(f"Length must be between {min_len} and {max_len} characters.")
             continue
         if not re.match(pattern, value):
-            print_error(f"{error_msg}")
+            print_error(error_msg)
             continue
         print_success(f"Accepted: {value}")
         return value
 
 
 def select_option(prompt, options, default=None):
-    """Display a numbered menu and return the selected value."""
     print(f"\n  {prompt}")
     for i, opt in enumerate(options, 1):
         if isinstance(opt, tuple):
@@ -179,7 +213,6 @@ def select_option(prompt, options, default=None):
 
 
 def confirm(prompt, default="n"):
-    """Ask a yes/no question."""
     hint = "[y/N]" if default == "n" else "[Y/n]"
     while True:
         ans = input(f"\n  {prompt} {hint}: ").strip().lower()
@@ -192,34 +225,52 @@ def confirm(prompt, default="n"):
         print_error("Enter y or n.")
 
 
-def collect_databases():
-    """Collect one or more database names from the engineer."""
+def input_number(prompt, min_val, max_val, default):
+    print(f"\n  {prompt} ({min_val}-{max_val}):")
+    while True:
+        val = input(f"  Enter value (default={default}): ").strip()
+        if val == "":
+            print_success(f"Using default: {default}")
+            return default
+        if val.isdigit() and min_val <= int(val) <= max_val:
+            print_success(f"Accepted: {val}")
+            return int(val)
+        print_error(f"Enter a number between {min_val} and {max_val}.")
+
+
+def collect_databases(existing=None):
     print("\n  Databases to create on this server.")
     print("  Press Enter with empty name when done.")
-    print("  Format  : lowercase letters, numbers and hyphens only")
+    print("  Format  : lowercase letters, numbers, hyphens or underscores")
     print("  Example : appdb")
+    if existing:
+        print(f"  Current : {', '.join(existing.keys())}")
     databases = {}
     while True:
-        name = input(f"  Database name (or Enter to finish): ").strip()
+        name = input("  Database name (or Enter to finish): ").strip()
         if name == "":
             if not databases:
                 print_error("At least one database is required.")
                 continue
             break
         if not re.match(r'^[a-z][a-z0-9_-]{1,62}$', name):
-            print_error("Use lowercase letters, numbers, hyphens or underscores. Min 2 chars.")
+            print_error("Lowercase letters, numbers, hyphens or underscores. Min 2 chars.")
             continue
         databases[name] = {
             "name":      name,
             "charset":   "UTF8",
             "collation": "en_US.utf8"
         }
-        print_success(f"Added database: {name}")
+        print_success(f"Added: {name}")
     return databases
 
 
+# ===========================================================================
+# GIT HELPERS
+# ===========================================================================
+
 def git_pull(repo_root):
-    print_step("Pulling latest from main...")
+    print_step("Switching to main and pulling latest...")
     ok, _, err = run_command("git checkout main", cwd=repo_root)
     if not ok:
         print_error(f"Failed to checkout main: {err}")
@@ -233,6 +284,8 @@ def git_pull(repo_root):
 
 def git_create_branch(repo_root, branch_name):
     print_step(f"Creating branch: {branch_name}")
+    # Delete branch if it already exists locally
+    run_command(f"git branch -D {branch_name}", cwd=repo_root)
     ok, _, err = run_command(f"git checkout -b {branch_name}", cwd=repo_root)
     if not ok:
         print_error(f"Failed to create branch: {err}")
@@ -240,7 +293,18 @@ def git_create_branch(repo_root, branch_name):
     print_success(f"Branch created: {branch_name}")
 
 
-def git_push_branch(repo_root, branch_name):
+def git_commit_and_push(repo_root, branch_name, message):
+    print_step("Committing changes...")
+    ok, _, err = run_command("git add .", cwd=repo_root)
+    if not ok:
+        print_error(f"Git add failed: {err}")
+        sys.exit(1)
+    ok, _, err = run_command(f'git commit -m "{message}"', cwd=repo_root)
+    if not ok:
+        print_error(f"Git commit failed: {err}")
+        sys.exit(1)
+    print_success("Changes committed.")
+
     print_step(f"Pushing branch: {branch_name}")
     ok, _, err = run_command(f"git push origin {branch_name}", cwd=repo_root)
     if not ok:
@@ -249,22 +313,21 @@ def git_push_branch(repo_root, branch_name):
     print_success("Branch pushed.")
 
 
-def print_pr_instructions(repo_slug, branch_name, server_name, action):
-    """Print next steps after push."""
+def print_next_steps(repo_slug, branch_name, server_name, environment, action):
     pr_url = f"https://github.com/{repo_slug}/pull/new/{branch_name}"
     print("\n" + "=" * 60)
     print("  NEXT STEPS")
     print("=" * 60)
     print(f"\n  1. Create Pull Request:")
     print(f"     {pr_url}")
-    print(f"\n  2. Get PR reviewed and approved by your team.")
+    print(f"\n  2. Get PR reviewed and approved.")
     if action == "create":
-        print(f"\n  3. After merge, deploy the server:")
-        print(f"     cd environments/dta/{server_name}")
+        print(f"\n  3. After merge, deploy:")
+        print(f"     cd environments/{environment}/{server_name}")
         print(f"     export TF_VAR_pg_admin_password='YourSecureP@ssword123!'")
         print(f"     terraform init")
         print(f"     terraform apply -var-file=\"terraform.tfvars\"")
-        print(f"\n  4. After apply, add Azure resource lock:")
+        print(f"\n  4. After apply, add resource lock:")
         print(f"     az lock create \\")
         print(f"       --name lock-{server_name} \\")
         print(f"       --resource-group <your-rg> \\")
@@ -273,94 +336,27 @@ def print_pr_instructions(repo_slug, branch_name, server_name, action):
         print(f"       --lock-type CanNotDelete")
     elif action == "modify":
         print(f"\n  3. After merge, apply changes:")
-        print(f"     cd environments/dta/{server_name}")
+        print(f"     cd environments/{environment}/{server_name}")
         print(f"     export TF_VAR_pg_admin_password='YourSecureP@ssword123!'")
         print(f"     terraform apply -var-file=\"terraform.tfvars\"")
     elif action == "delete":
-        print(f"\n  3. After merge, remove Azure lock then destroy:")
+        print(f"\n  3. After merge, remove lock then destroy:")
         print(f"     az lock delete \\")
         print(f"       --name lock-{server_name} \\")
         print(f"       --resource-group <your-rg> \\")
         print(f"       --resource-type Microsoft.DBforPostgreSQL/flexibleServers \\")
         print(f"       --resource {server_name}")
-        print(f"     cd environments/dta/{server_name}")
+        print(f"     cd environments/{environment}/{server_name}")
         print(f"     export TF_VAR_pg_admin_password='YourSecureP@ssword123!'")
         print(f"     terraform destroy -var-file=\"terraform.tfvars\"")
     print()
 
 
 # ===========================================================================
-# TFVARS WRITER
+# FILE WRITERS
 # ===========================================================================
-
-def write_tfvars(path, data):
-    """Write terraform.tfvars from collected data."""
-    db_block = ""
-    for db in data["databases"].values():
-        db_block += f"""  {db["name"]} = {{
-    name      = "{db["name"]}"
-    charset   = "UTF8"
-    collation = "en_US.utf8"
-  }}
-"""
-    content = f"""# ===========================================================================
-# terraform.tfvars — {data["server_name"]}
-# Generated by pg_manager.py — do not edit manually
-# ===========================================================================
-
-# Identity & Environment
-subscription_id = "{data["subscription_id"]}"
-tenant_id       = "{data["tenant_id"]}"
-environment     = "{data["environment"]}"
-project         = "{data["project"]}"
-
-# Resource Group
-pg_resource_group_name = "{data["pg_resource_group_name"]}"
-
-# Networking
-vnet_name                            = "{data["vnet_name"]}"
-vnet_resource_group_name             = "{data["vnet_resource_group_name"]}"
-pe_subnet_name                       = "{data["pe_subnet_name"]}"
-private_dns_zone_name                = "privatelink.postgres.database.azure.com"
-private_dns_zone_resource_group_name = "{data["private_dns_zone_resource_group_name"]}"
-
-# PostgreSQL Server
-pg_server_name       = "{data["server_name"]}"
-pg_version           = {data["pg_version"]}
-pg_sku_name          = "{data["pg_sku_name"]}"
-pg_storage_mb        = {data["pg_storage_mb"]}
-pg_storage_tier      = null
-pg_auto_grow_enabled = {str(data["pg_auto_grow_enabled"]).lower()}
-pg_zone              = {data["pg_zone"]}
-
-# Administrator
-pg_admin_login = "{data["pg_admin_login"]}"
-
-# Backup
-pg_backup_retention_days        = {data["pg_backup_retention_days"]}
-pg_geo_redundant_backup_enabled = {str(data["pg_geo_redundant_backup_enabled"]).lower()}
-
-# Maintenance Window
-pg_maintenance_window = {{
-  day_of_week  = {data["maintenance_day"]}
-  start_hour   = {data["maintenance_hour"]}
-  start_minute = {data["maintenance_minute"]}
-}}
-
-# High Availability
-pg_ha_enabled      = {str(data["pg_ha_enabled"]).lower()}
-pg_ha_standby_zone = {data["pg_ha_standby_zone"]}
-
-# Databases
-pg_databases = {{
-{db_block}}}
-"""
-    with open(path, "w") as f:
-        f.write(content)
-
 
 def write_global_tf(path, environment, server_name, storage_account):
-    """Write 00_global.tf with correct backend key."""
     content = f"""terraform {{
   required_version = ">= 1.9, < 2.0"
 
@@ -393,13 +389,136 @@ provider "azurerm" {{
         f.write(content)
 
 
+def write_tfvars(path, data):
+    db_block = ""
+    for db in data["databases"].values():
+        db_block += f"""  {db["name"]} = {{
+    name      = "{db["name"]}"
+    charset   = "UTF8"
+    collation = "en_US.utf8"
+  }}
+"""
+    content = f"""# ===========================================================================
+# terraform.tfvars — {data["server_name"]}
+# Generated by paas-deployer.py — do not edit manually
+# ===========================================================================
+
+subscription_id = "{data["subscription_id"]}"
+tenant_id       = "{data["tenant_id"]}"
+environment     = "{data["environment"]}"
+project         = "{data["project"]}"
+
+pg_resource_group_name = "{data["pg_resource_group_name"]}"
+
+vnet_name                            = "{data["vnet_name"]}"
+vnet_resource_group_name             = "{data["vnet_resource_group_name"]}"
+pe_subnet_name                       = "{data["pe_subnet_name"]}"
+private_dns_zone_name                = "privatelink.postgres.database.azure.com"
+private_dns_zone_resource_group_name = "{data["private_dns_zone_resource_group_name"]}"
+
+pg_server_name       = "{data["server_name"]}"
+pg_version           = {data["pg_version"]}
+pg_sku_name          = "{data["pg_sku_name"]}"
+pg_storage_mb        = {data["pg_storage_mb"]}
+pg_storage_tier      = null
+pg_auto_grow_enabled = {str(data["pg_auto_grow_enabled"]).lower()}
+pg_zone              = {data["pg_zone"]}
+
+pg_admin_login = "{data["pg_admin_login"]}"
+
+pg_backup_retention_days        = {data["pg_backup_retention_days"]}
+pg_geo_redundant_backup_enabled = {str(data["pg_geo_redundant_backup_enabled"]).lower()}
+
+pg_maintenance_window = {{
+  day_of_week  = {data["maintenance_day"]}
+  start_hour   = {data["maintenance_hour"]}
+  start_minute = {data["maintenance_minute"]}
+}}
+
+pg_ha_enabled      = {str(data["pg_ha_enabled"]).lower()}
+pg_ha_standby_zone = {data["pg_ha_standby_zone"]}
+
+pg_databases = {{
+{db_block}}}
+"""
+    with open(path, "w") as f:
+        f.write(content)
+
+
+# ===========================================================================
+# READ EXISTING TFVARS
+# ===========================================================================
+
+def read_existing_tfvars(tfvars_path):
+    data = {}
+    if not tfvars_path.exists():
+        return data
+    content = tfvars_path.read_text()
+
+    def extract(key, cast=str):
+        match = re.search(rf'^{key}\s*=\s*"?([^"\n#]+)"?', content, re.MULTILINE)
+        if match:
+            val = match.group(1).strip().strip('"')
+            try:
+                return cast(val)
+            except:
+                return val
+        return None
+
+    data["environment"]                          = extract("environment")
+    data["project"]                              = extract("project")
+    data["server_name"]                          = extract("pg_server_name")
+    data["pg_resource_group_name"]               = extract("pg_resource_group_name")
+    data["vnet_name"]                            = extract("vnet_name")
+    data["vnet_resource_group_name"]             = extract("vnet_resource_group_name")
+    data["pe_subnet_name"]                       = extract("pe_subnet_name")
+    data["private_dns_zone_resource_group_name"] = extract("private_dns_zone_resource_group_name")
+    data["pg_version"]                           = extract("pg_version", int)
+    data["pg_sku_name"]                          = extract("pg_sku_name")
+    data["pg_storage_mb"]                        = extract("pg_storage_mb", int)
+    data["pg_zone"]                              = extract("pg_zone", int)
+    data["pg_admin_login"]                       = extract("pg_admin_login")
+    data["pg_backup_retention_days"]             = extract("pg_backup_retention_days", int)
+    data["maintenance_day"]                      = extract("day_of_week", int)
+    data["maintenance_hour"]                     = extract("start_hour", int)
+    data["maintenance_minute"]                   = extract("start_minute", int)
+    data["pg_ha_standby_zone"]                   = extract("pg_ha_standby_zone", int)
+
+    for bool_key, tf_key in [
+        ("pg_auto_grow_enabled",            "pg_auto_grow_enabled"),
+        ("pg_geo_redundant_backup_enabled", "pg_geo_redundant_backup_enabled"),
+        ("pg_ha_enabled",                   "pg_ha_enabled"),
+    ]:
+        m = re.search(rf'^{tf_key}\s*=\s*(true|false)', content, re.MULTILINE)
+        if m:
+            data[bool_key] = m.group(1) == "true"
+
+    db_names = re.findall(r'^\s*name\s*=\s*"([^"]+)"', content, re.MULTILINE)
+    data["databases"] = {
+        name: {"name": name, "charset": "UTF8", "collation": "en_US.utf8"}
+        for name in db_names
+    }
+    return data
+
+
+def list_servers(repo_root):
+    servers = []
+    env_path = repo_root / "environments"
+    for env_dir in sorted(env_path.iterdir()):
+        if not env_dir.is_dir():
+            continue
+        for server_dir in sorted(env_dir.iterdir()):
+            if server_dir.is_dir() and (server_dir / "terraform.tfvars").exists():
+                servers.append((env_dir.name, server_dir.name, server_dir))
+    return servers
+
+
 # ===========================================================================
 # INPUT COLLECTION
 # ===========================================================================
 
-def collect_server_inputs(subscription_id, tenant_id, existing_data=None):
-    """Collect all inputs for a server. If existing_data provided, use as defaults."""
-    e = existing_data or {}
+def collect_inputs(subscription_id, tenant_id, existing=None):
+    e = existing or {}
     data = {}
     data["subscription_id"] = subscription_id
     data["tenant_id"]       = tenant_id
@@ -412,7 +531,6 @@ def collect_server_inputs(subscription_id, tenant_id, existing_data=None):
     )
 
     print_header("Project Details")
-    print("\n  Project name:")
     data["project"] = validate_input(
         "Project name",
         r'^[a-z][a-z0-9-]{1,18}[a-z0-9]$',
@@ -422,20 +540,18 @@ def collect_server_inputs(subscription_id, tenant_id, existing_data=None):
         min_len=3, max_len=20
     )
 
-    print("\n  Server name (must be globally unique across all of Azure):")
     data["server_name"] = validate_input(
-        "Server name",
+        "Server name (must be globally unique across all of Azure)",
         r'^[a-z][a-z0-9-]{1,61}[a-z0-9]$',
-        f"psql-{data['project']}-{data['environment']}-001",
+        f"psql-{data.get('project', 'myapp')}-{data['environment']}-001",
         "Lowercase letters, numbers and hyphens only. 3-63 chars.",
         default=e.get("server_name"),
         min_len=3, max_len=63
     )
 
     print_header("Resource Group")
-    print("\n  Resource group where the PostgreSQL server will be created:")
     data["pg_resource_group_name"] = validate_input(
-        "Resource group",
+        "Resource group name (must already exist)",
         r'^[a-zA-Z0-9._-]{1,90}$',
         "rg-myapp-dta",
         "Letters, numbers, hyphens, underscores and periods only.",
@@ -444,7 +560,6 @@ def collect_server_inputs(subscription_id, tenant_id, existing_data=None):
     )
 
     print_header("Networking")
-    print("\n  VNet name:")
     data["vnet_name"] = validate_input(
         "VNet name",
         r'^[a-zA-Z0-9._-]{2,64}$',
@@ -454,7 +569,6 @@ def collect_server_inputs(subscription_id, tenant_id, existing_data=None):
         min_len=2, max_len=64
     )
 
-    print("\n  VNet resource group:")
     data["vnet_resource_group_name"] = validate_input(
         "VNet resource group",
         r'^[a-zA-Z0-9._-]{1,90}$',
@@ -464,9 +578,8 @@ def collect_server_inputs(subscription_id, tenant_id, existing_data=None):
         min_len=1, max_len=90
     )
 
-    print("\n  Private endpoint subnet name:")
     data["pe_subnet_name"] = validate_input(
-        "PE subnet name",
+        "Private endpoint subnet name",
         r'^[a-zA-Z0-9._-]{2,80}$',
         "snet-private-endpoints",
         "Letters, numbers, hyphens, underscores and periods only.",
@@ -474,9 +587,8 @@ def collect_server_inputs(subscription_id, tenant_id, existing_data=None):
         min_len=2, max_len=80
     )
 
-    print("\n  Private DNS zone resource group:")
     data["private_dns_zone_resource_group_name"] = validate_input(
-        "DNS zone resource group",
+        "Private DNS zone resource group",
         r'^[a-zA-Z0-9._-]{1,90}$',
         "rg-network-dta",
         "Letters, numbers, hyphens, underscores and periods only.",
@@ -520,9 +632,8 @@ def collect_server_inputs(subscription_id, tenant_id, existing_data=None):
     )
 
     print_header("Administrator")
-    print("\n  Admin login username:")
     data["pg_admin_login"] = validate_input(
-        "Admin login",
+        "Admin login username",
         r'^[a-zA-Z][a-zA-Z0-9_]{1,62}$',
         "psqladmin",
         "Letters, numbers and underscores. Must start with a letter. 2-63 chars.",
@@ -531,18 +642,11 @@ def collect_server_inputs(subscription_id, tenant_id, existing_data=None):
     )
 
     print_header("Backup")
-    print("\n  Backup retention days (7-35):")
-    while True:
-        val = input(f"  Enter value (default={e.get('pg_backup_retention_days', 7)}): ").strip()
-        if val == "":
-            data["pg_backup_retention_days"] = e.get("pg_backup_retention_days", 7)
-            print_success(f"Using: {data['pg_backup_retention_days']}")
-            break
-        if val.isdigit() and 7 <= int(val) <= 35:
-            data["pg_backup_retention_days"] = int(val)
-            print_success(f"Accepted: {val}")
-            break
-        print_error("Enter a number between 7 and 35.")
+    data["pg_backup_retention_days"] = input_number(
+        "Backup retention days",
+        7, 35,
+        default=e.get("pg_backup_retention_days", 7)
+    )
 
     data["pg_geo_redundant_backup_enabled"] = confirm(
         "Enable geo-redundant backup? (recommended for prod)",
@@ -550,24 +654,18 @@ def collect_server_inputs(subscription_id, tenant_id, existing_data=None):
     )
 
     print_header("Maintenance Window")
-    data["maintenance_day"] = DAYS_OF_WEEK.index(select_option(
+    day_name = select_option(
         "Maintenance day:",
         DAYS_OF_WEEK,
         default=DAYS_OF_WEEK[e.get("maintenance_day", 0)]
-    ))
+    )
+    data["maintenance_day"] = DAYS_OF_WEEK.index(day_name)
 
-    print("\n  Maintenance start hour (0-23 UTC):")
-    while True:
-        val = input(f"  Enter value (default={e.get('maintenance_hour', 2)}): ").strip()
-        if val == "":
-            data["maintenance_hour"] = e.get("maintenance_hour", 2)
-            print_success(f"Using: {data['maintenance_hour']}")
-            break
-        if val.isdigit() and 0 <= int(val) <= 23:
-            data["maintenance_hour"] = int(val)
-            print_success(f"Accepted: {val}")
-            break
-        print_error("Enter a number between 0 and 23.")
+    data["maintenance_hour"] = input_number(
+        "Maintenance start hour (UTC)",
+        0, 23,
+        default=e.get("maintenance_hour", 2)
+    )
 
     data["maintenance_minute"] = select_option(
         "Maintenance start minute:",
@@ -591,13 +689,12 @@ def collect_server_inputs(subscription_id, tenant_id, existing_data=None):
         data["pg_ha_standby_zone"] = 2 if data["pg_zone"] != 2 else 3
 
     print_header("Databases")
-    data["databases"] = collect_databases()
+    data["databases"] = collect_databases(existing=e.get("databases"))
 
     return data
 
 
 def print_summary(data):
-    """Print a summary of all collected inputs."""
     print_header("SUMMARY — Please review before proceeding")
     print(f"""
   Environment     : {data['environment']}
@@ -616,7 +713,7 @@ def print_summary(data):
   Auto Grow       : {data['pg_auto_grow_enabled']}
   Admin Login     : {data['pg_admin_login']}
 
-  Backup Retention: {data['pg_backup_retention_days']} days
+  Backup Days     : {data['pg_backup_retention_days']}
   Geo Redundant   : {data['pg_geo_redundant_backup_enabled']}
 
   Maintenance     : {DAYS_OF_WEEK[data['maintenance_day']]} {data['maintenance_hour']:02d}:{data['maintenance_minute']:02d} UTC
@@ -632,106 +729,16 @@ def print_summary(data):
 
 
 # ===========================================================================
-# READ EXISTING TFVARS
-# ===========================================================================
-
-def read_existing_tfvars(tfvars_path):
-    """Parse existing tfvars into a dict for use as defaults in modify flow."""
-    data = {}
-    if not tfvars_path.exists():
-        return data
-    content = tfvars_path.read_text()
-
-    def extract(key, cast=str):
-        match = re.search(rf'^{key}\s*=\s*"?([^"\n]+)"?', content, re.MULTILINE)
-        if match:
-            val = match.group(1).strip()
-            try:
-                return cast(val)
-            except:
-                return val
-        return None
-
-    data["environment"]                          = extract("environment")
-    data["project"]                              = extract("project")
-    data["server_name"]                          = extract("pg_server_name")
-    data["pg_resource_group_name"]               = extract("pg_resource_group_name")
-    data["vnet_name"]                            = extract("vnet_name")
-    data["vnet_resource_group_name"]             = extract("vnet_resource_group_name")
-    data["pe_subnet_name"]                       = extract("pe_subnet_name")
-    data["private_dns_zone_resource_group_name"] = extract("private_dns_zone_resource_group_name")
-    data["pg_version"]                           = extract("pg_version", int)
-    data["pg_sku_name"]                          = extract("pg_sku_name")
-    data["pg_storage_mb"]                        = extract("pg_storage_mb", int)
-    data["pg_zone"]                              = extract("pg_zone", int)
-    data["pg_admin_login"]                       = extract("pg_admin_login")
-    data["pg_backup_retention_days"]             = extract("pg_backup_retention_days", int)
-    data["maintenance_day"]                      = extract("day_of_week", int)
-    data["maintenance_hour"]                     = extract("start_hour", int)
-    data["maintenance_minute"]                   = extract("start_minute", int)
-
-    for bool_key, tf_key in [
-        ("pg_auto_grow_enabled",         "pg_auto_grow_enabled"),
-        ("pg_geo_redundant_backup_enabled", "pg_geo_redundant_backup_enabled"),
-        ("pg_ha_enabled",                "pg_ha_enabled"),
-    ]:
-        m = re.search(rf'^{tf_key}\s*=\s*(true|false)', content, re.MULTILINE)
-        if m:
-            data[bool_key] = m.group(1) == "true"
-
-    data["pg_ha_standby_zone"] = extract("pg_ha_standby_zone", int)
-
-    # Parse databases block
-    db_matches = re.findall(r'name\s*=\s*"([^"]+)"', content)
-    data["databases"] = {name: {"name": name, "charset": "UTF8", "collation": "en_US.utf8"}
-                         for name in db_matches if name != "appdb" or True}
-    return data
-
-
-def list_servers(repo_root, environment=None):
-    """List existing server folders."""
-    servers = []
-    env_path = repo_root / "environments"
-    if environment:
-        envs = [env_path / environment]
-    else:
-        envs = [p for p in env_path.iterdir() if p.is_dir()]
-    for env_dir in envs:
-        if env_dir.is_dir():
-            for server_dir in sorted(env_dir.iterdir()):
-                if server_dir.is_dir() and (server_dir / "terraform.tfvars").exists():
-                    servers.append((env_dir.name, server_dir.name, server_dir))
-    return servers
-
-
-# ===========================================================================
 # FLOWS
 # ===========================================================================
 
-def get_storage_account(repo_root):
-    """Read storage account name from an existing 00_global.tf."""
-    for env_dir in (repo_root / "environments").iterdir():
-        for server_dir in env_dir.iterdir():
-            tf = server_dir / "00_global.tf"
-            if tf.exists():
-                m = re.search(r'storage_account_name\s*=\s*"([^"]+)"', tf.read_text())
-                if m:
-                    return m.group(1)
-    # Fall back to template
-    tf = repo_root / "_template" / "00_global.tf"
-    if tf.exists():
-        m = re.search(r'storage_account_name\s*=\s*"([^"]+)"', tf.read_text())
-        if m:
-            return m.group(1)
-    return "stttfstatesiva001"
-
-
 def create_server(repo_root, repo_slug):
+    clear_screen()
     print_header("CREATE NEW SERVER")
     subscription_id, tenant_id = get_az_account()
     storage_account = get_storage_account(repo_root)
 
-    data = collect_server_inputs(subscription_id, tenant_id)
+    data = collect_inputs(subscription_id, tenant_id)
     print_summary(data)
 
     if not confirm("Proceed with these settings?", default="n"):
@@ -750,39 +757,25 @@ def create_server(repo_root, repo_slug):
     git_pull(repo_root)
     git_create_branch(repo_root, branch_name)
 
-    # Copy template
-    print_step(f"Creating server folder: {server_path}")
-    import shutil
+    print_step(f"Creating server folder...")
     shutil.copytree(repo_root / "_template", server_path)
 
-    # Write files
-    write_global_tf(
-        server_path / "00_global.tf",
-        environment, server_name, storage_account
-    )
+    write_global_tf(server_path / "00_global.tf", environment, server_name, storage_account)
     write_tfvars(server_path / "terraform.tfvars", data)
 
-    # Remove example tfvars from instance folder
+    # Remove example file from instance folder
     example = server_path / "terraform.tfvars.example"
     if example.exists():
         example.unlink()
 
-    print_success(f"Server folder created: {server_path}")
+    print_success(f"Server folder created: environments/{environment}/{server_name}")
 
-    # Git commit and push
-    ok, _, err = run_command(
-        f'git add . && git commit -m "Add {server_name} PostgreSQL server"',
-        cwd=repo_root
-    )
-    if not ok:
-        print_error(f"Git commit failed: {err}")
-        return
-
-    git_push_branch(repo_root, branch_name)
-    print_pr_instructions(repo_slug, branch_name, server_name, "create")
+    git_commit_and_push(repo_root, branch_name, f"Add {server_name} PostgreSQL server")
+    print_next_steps(repo_slug, branch_name, server_name, environment, "create")
 
 
 def modify_server(repo_root, repo_slug):
+    clear_screen()
     print_header("MODIFY EXISTING SERVER")
 
     servers = list_servers(repo_root)
@@ -790,19 +783,16 @@ def modify_server(repo_root, repo_slug):
         print_error("No existing servers found.")
         return
 
-    print("\n  Select server to modify:")
     options = [f"{env}/{name}" for env, name, _ in servers]
-    selected = select_option("Available servers:", options)
+    selected = select_option("Select server to modify:", options)
     env, name = selected.split("/")
     server_path = repo_root / "environments" / env / name
 
-    print_step(f"Reading current configuration for: {name}")
+    print_step(f"Reading current configuration...")
     existing = read_existing_tfvars(server_path / "terraform.tfvars")
 
-    print_header("MODIFY OPTIONS")
+    print_header("WHAT WOULD YOU LIKE TO MODIFY?")
     print("""
-  What would you like to modify?
-
     1) SKU (compute size)
     2) Storage size
     3) Backup retention days
@@ -830,49 +820,39 @@ def modify_server(repo_root, repo_slug):
     data["tenant_id"]       = tenant_id
 
     if choice in ["1", "8"]:
+        print_header("SKU")
         tier = select_option("SKU tier:", list(SKU_OPTIONS.keys()), default="GeneralPurpose")
         data["pg_sku_name"] = select_option("SKU size:", SKU_OPTIONS[tier], default=existing.get("pg_sku_name"))
 
     if choice in ["2", "8"]:
+        print_header("Storage")
         data["pg_storage_mb"] = select_option("Storage size:", STORAGE_OPTIONS, default=existing.get("pg_storage_mb", 32768))
 
     if choice in ["3", "8"]:
-        print("\n  Backup retention days (7-35):")
-        while True:
-            val = input(f"  Enter value (default={existing.get('pg_backup_retention_days', 7)}): ").strip()
-            if val == "":
-                data["pg_backup_retention_days"] = existing.get("pg_backup_retention_days", 7)
-                break
-            if val.isdigit() and 7 <= int(val) <= 35:
-                data["pg_backup_retention_days"] = int(val)
-                break
-            print_error("Enter a number between 7 and 35.")
+        print_header("Backup Retention")
+        data["pg_backup_retention_days"] = input_number("Backup retention days", 7, 35, default=existing.get("pg_backup_retention_days", 7))
 
     if choice in ["4", "8"]:
+        print_header("Geo Redundant Backup")
         data["pg_geo_redundant_backup_enabled"] = confirm("Enable geo-redundant backup?", default="n")
 
     if choice in ["5", "8"]:
-        data["maintenance_day"] = DAYS_OF_WEEK.index(select_option("Maintenance day:", DAYS_OF_WEEK, default=DAYS_OF_WEEK[existing.get("maintenance_day", 0)]))
-        print("\n  Maintenance start hour (0-23 UTC):")
-        while True:
-            val = input(f"  Enter value (default={existing.get('maintenance_hour', 2)}): ").strip()
-            if val == "":
-                data["maintenance_hour"] = existing.get("maintenance_hour", 2)
-                break
-            if val.isdigit() and 0 <= int(val) <= 23:
-                data["maintenance_hour"] = int(val)
-                break
-            print_error("Enter a number between 0 and 23.")
+        print_header("Maintenance Window")
+        day_name = select_option("Maintenance day:", DAYS_OF_WEEK, default=DAYS_OF_WEEK[existing.get("maintenance_day", 0)])
+        data["maintenance_day"]    = DAYS_OF_WEEK.index(day_name)
+        data["maintenance_hour"]   = input_number("Maintenance start hour (UTC)", 0, 23, default=existing.get("maintenance_hour", 2))
         data["maintenance_minute"] = select_option("Maintenance start minute:", START_MINUTES, default=existing.get("maintenance_minute", 0))
 
     if choice in ["6", "8"]:
+        print_header("High Availability")
         data["pg_ha_enabled"] = confirm("Enable Zone-Redundant High Availability?", default="n")
         if data["pg_ha_enabled"]:
             available_zones = [z for z in ZONES if z != data.get("pg_zone", 1)]
             data["pg_ha_standby_zone"] = select_option("Standby zone:", available_zones, default=available_zones[0])
 
     if choice in ["7", "8"]:
-        data["databases"] = collect_databases()
+        print_header("Databases")
+        data["databases"] = collect_databases(existing=existing.get("databases"))
 
     print_summary(data)
     if not confirm("Proceed with these changes?", default="n"):
@@ -886,19 +866,12 @@ def modify_server(repo_root, repo_slug):
     write_tfvars(server_path / "terraform.tfvars", data)
     print_success("terraform.tfvars updated.")
 
-    ok, _, err = run_command(
-        f'git add . && git commit -m "Modify {name} PostgreSQL server"',
-        cwd=repo_root
-    )
-    if not ok:
-        print_error(f"Git commit failed: {err}")
-        return
-
-    git_push_branch(repo_root, branch_name)
-    print_pr_instructions(repo_slug, branch_name, name, "modify")
+    git_commit_and_push(repo_root, branch_name, f"Modify {name} PostgreSQL server")
+    print_next_steps(repo_slug, branch_name, name, env, "modify")
 
 
 def delete_server(repo_root, repo_slug):
+    clear_screen()
     print_header("DELETE SERVER")
 
     servers = list_servers(repo_root)
@@ -906,21 +879,20 @@ def delete_server(repo_root, repo_slug):
         print_error("No existing servers found.")
         return
 
-    print("\n  Select server to delete:")
     options = [f"{env}/{name}" for env, name, _ in servers]
-    selected = select_option("Available servers:", options)
+    selected = select_option("Select server to delete:", options)
     env, name = selected.split("/")
     server_path = repo_root / "environments" / env / name
 
     print(f"""
-  ⚠  WARNING: You are about to delete {name}
-  This will remove the server folder from the repo.
+  WARNING: You are about to delete {name}
+  This removes the server folder from the repo.
   After PR approval you must manually:
     1. Remove the Azure resource lock
     2. Run terraform destroy
     """)
 
-    print("  Type the server name to confirm deletion:")
+    print("  To confirm, type the server name exactly:")
     confirm_name = input(f"  Server name: ").strip()
     if confirm_name != name:
         print_error(f"Name does not match. Expected: {name}")
@@ -934,42 +906,35 @@ def delete_server(repo_root, repo_slug):
     git_pull(repo_root)
     git_create_branch(repo_root, branch_name)
 
-    import shutil
     shutil.rmtree(server_path)
-    print_success(f"Removed folder: {server_path}")
+    print_success(f"Removed: environments/{env}/{name}")
 
-    ok, _, err = run_command(
-        f'git add . && git commit -m "Remove {name} PostgreSQL server"',
-        cwd=repo_root
-    )
-    if not ok:
-        print_error(f"Git commit failed: {err}")
-        return
-
-    git_push_branch(repo_root, branch_name)
-    print_pr_instructions(repo_slug, branch_name, name, "delete")
+    git_commit_and_push(repo_root, branch_name, f"Remove {name} PostgreSQL server")
+    print_next_steps(repo_slug, branch_name, name, env, "delete")
 
 
 # ===========================================================================
-# MAIN MENU
+# MAIN
 # ===========================================================================
 
 def main():
-    print_header("PostgreSQL Flexible Server Manager")
+    clear_screen()
+    print_header("paas-deployer — PostgreSQL Flexible Server Manager")
     print("""
-  This tool manages Azure PostgreSQL Flexible Server deployments
+  Manages Azure PostgreSQL Flexible Server deployments
   via Terraform and GitHub Pull Request workflow.
 
   Prerequisites:
-    - Authenticated to Azure  : az login
-    - SSH access to GitHub    : ssh -T git@github.com
+    - Logged in to Azure  : az login --tenant <id> --use-device-code
+    - SSH access to GitHub: ssh -T git@github.com
+    - Terraform repo path : set TERRAFORM_REPO env var if not auto-detected
     """)
 
-    repo_root  = get_repo_root()
-    repo_slug  = get_github_remote(repo_root)
+    repo_root = get_repo_root()
+    repo_slug = get_github_remote(repo_root)
 
-    print_success(f"Repo : {repo_slug}")
-    print_success(f"Root : {repo_root}")
+    print_success(f"Terraform repo : {repo_root}")
+    print_success(f"GitHub remote  : {repo_slug}")
 
     while True:
         print("""
@@ -983,10 +948,16 @@ def main():
         choice = input("  Enter choice [1-4]: ").strip()
         if choice == "1":
             create_server(repo_root, repo_slug)
+            input("\n  Press Enter to return to main menu...")
+            clear_screen()
         elif choice == "2":
             modify_server(repo_root, repo_slug)
+            input("\n  Press Enter to return to main menu...")
+            clear_screen()
         elif choice == "3":
             delete_server(repo_root, repo_slug)
+            input("\n  Press Enter to return to main menu...")
+            clear_screen()
         elif choice == "4":
             print("\n  Goodbye.\n")
             sys.exit(0)
@@ -996,4 +967,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-ENDOFFILE
