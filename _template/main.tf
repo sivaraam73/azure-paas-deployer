@@ -4,7 +4,7 @@
 # ===========================================================================
 
 module "postgresql" {
-  source = "../../modules/postgresql"
+  source = "../../../modules/postgresql"
 
   # Identity & Environment
   subscription_id = var.subscription_id
