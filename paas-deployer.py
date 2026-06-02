@@ -60,6 +60,10 @@ DAYS_OF_WEEK  = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday
 START_MINUTES = [0, 30]
 DNS_ZONE_NAME = "privatelink.postgres.database.azure.com"
 
+# Sentinel values for navigation
+BACK = "__BACK__"
+QUIT = "__QUIT__"
+
 # ===========================================================================
 # DISPLAY HELPERS
 # ===========================================================================
@@ -67,22 +71,32 @@ DNS_ZONE_NAME = "privatelink.postgres.database.azure.com"
 def clear_screen():
     os.system("cls" if os.name == "nt" else "clear")
 
-def print_header(title):
+
+def print_header(title, step=None, total=None):
     print("\n" + "=" * 60)
-    print(f"  {title}")
+    if step and total:
+        print(f"  {title}  [Step {step} of {total}]")
+    else:
+        print(f"  {title}")
     print("=" * 60)
+    print("  Type B to go back, Q to quit at any prompt.")
+
 
 def print_step(msg):
     print(f"\n  -> {msg}")
 
+
 def print_success(msg):
     print(f"  [OK] {msg}")
+
 
 def print_error(msg):
     print(f"  [ERROR] {msg}")
 
+
 def print_missing(msg):
     print(f"  [MISSING] {msg}")
+
 
 # ===========================================================================
 # SHELL HELPER
@@ -95,9 +109,21 @@ def run_command(cmd, cwd=None):
     )
     return result.returncode == 0, result.stdout.strip(), result.stderr.strip()
 
+
 # ===========================================================================
-# INPUT HELPERS
+# NAVIGATION-AWARE INPUT HELPERS
+# All return BACK, QUIT, or the collected value
 # ===========================================================================
+
+def nav_input(prompt):
+    """Raw input that checks for B (back) or Q (quit)."""
+    val = input(prompt).strip()
+    if val.upper() == "B":
+        return BACK
+    if val.upper() == "Q":
+        return QUIT
+    return val
+
 
 def validate_input(prompt, pattern, example, error_msg, default=None, min_len=1, max_len=100):
     default_hint = f" (default={default})" if default is not None else ""
@@ -105,7 +131,9 @@ def validate_input(prompt, pattern, example, error_msg, default=None, min_len=1,
     print(f"  Format  : {error_msg}")
     print(f"  Example : {example}")
     while True:
-        value = input(f"  Enter value{default_hint}: ").strip()
+        value = nav_input(f"  Enter value{default_hint}: ")
+        if value in (BACK, QUIT):
+            return value
         if value == "" and default is not None:
             print_success(f"Using default: {default}")
             return str(default)
@@ -133,16 +161,14 @@ def select_option(prompt, options, default=None):
             value = opt
         marker = " (default)" if (default is not None and value == default) else ""
         print(f"    {i}) {label}{marker}")
+    print(f"    B) Go back")
+    print(f"    Q) Quit")
     while True:
-        choice = input(f"  Enter choice [1-{len(options)}]: ").strip()
-        if choice == "" and default is not None:
-            for opt in options:
-                v = opt[0] if isinstance(opt, tuple) else opt
-                if v == default:
-                    print_success(f"Using default: {default}")
-                    return default
+        choice = nav_input(f"  Enter choice [1-{len(options)}]: ")
+        if choice in (BACK, QUIT):
+            return choice
         if not choice.isdigit() or not (1 <= int(choice) <= len(options)):
-            print_error(f"Enter a number between 1 and {len(options)}.")
+            print_error(f"Enter a number between 1 and {len(options)}, B to go back, or Q to quit.")
             continue
         selected = options[int(choice) - 1]
         value = selected[0] if isinstance(selected, tuple) else selected
@@ -151,41 +177,55 @@ def select_option(prompt, options, default=None):
 
 
 def confirm(prompt, default="n"):
-    hint = "[y/N]" if default == "n" else "[Y/n]"
+    default_label = "Y" if default == "y" else "N"
+    print(f"\n  {prompt}")
+    print(f"    1) Yes")
+    print(f"    2) No  (default)" if default == "n" else f"    2) No")
+    print(f"    B) Go back")
+    print(f"    Q) Quit")
     while True:
-        ans = input(f"\n  {prompt} {hint}: ").strip().lower()
-        if ans == "":
-            ans = default
-        if ans in ["y", "yes"]:
+        ans = nav_input(f"  Enter choice [1/2]: ")
+        if ans in (BACK, QUIT):
+            return ans
+        if ans == "" or ans == "2":
+            return default == "y"
+        if ans == "1":
             return True
-        if ans in ["n", "no"]:
+        if ans.lower() in ["y", "yes"]:
+            return True
+        if ans.lower() in ["n", "no"]:
             return False
-        print_error("Enter y or n.")
+        print_error("Enter 1 (Yes), 2 (No), B to go back, or Q to quit.")
 
 
 def input_number(prompt, min_val, max_val, default):
     print(f"\n  {prompt} ({min_val}-{max_val}):")
     while True:
-        val = input(f"  Enter value (default={default}): ").strip()
+        val = nav_input(f"  Enter value (default={default}): ")
+        if val in (BACK, QUIT):
+            return val
         if val == "":
             print_success(f"Using default: {default}")
             return default
         if val.isdigit() and min_val <= int(val) <= max_val:
             print_success(f"Accepted: {val}")
             return int(val)
-        print_error(f"Enter a number between {min_val} and {max_val}.")
+        print_error(f"Enter a number between {min_val} and {max_val}, B to go back, or Q to quit.")
 
 
 def collect_databases(existing=None):
     print("\n  Databases to create on this server.")
     print("  Press Enter with empty name when done.")
+    print("  Type B to go back, Q to quit.")
     print("  Format  : lowercase letters, numbers, hyphens or underscores")
     print("  Example : appdb")
     if existing:
         print(f"  Current : {', '.join(existing.keys())}")
     databases = {}
     while True:
-        name = input("  Database name (or Enter to finish): ").strip()
+        name = nav_input("  Database name (or Enter to finish): ")
+        if name in (BACK, QUIT):
+            return name
         if name == "":
             if not databases:
                 print_error("At least one database is required.")
@@ -201,11 +241,9 @@ def collect_databases(existing=None):
 
 # ===========================================================================
 # AZURE RESOURCE SELECTORS
-# Show existing resources, let engineer pick or enter new name
 # ===========================================================================
 
 def _pick_or_new(label, items, new_label, validate_fn, default=None):
-    """Generic picker: show existing items + option to create new."""
     options = items + [f"[ {new_label} ]"]
     print(f"\n  {label}:")
     if items:
@@ -215,13 +253,14 @@ def _pick_or_new(label, items, new_label, validate_fn, default=None):
     for i, item in enumerate(options, 1):
         marker = " (default)" if item == default else ""
         print(f"    {i}) {item}{marker}")
+    print(f"    B) Go back")
+    print(f"    Q) Quit")
     while True:
-        choice = input(f"  Enter choice [1-{len(options)}]: ").strip()
-        if choice == "" and default and default in items:
-            print_success(f"Using default: {default}")
-            return default
+        choice = nav_input(f"  Enter choice [1-{len(options)}]: ")
+        if choice in (BACK, QUIT):
+            return choice
         if not choice.isdigit() or not (1 <= int(choice) <= len(options)):
-            print_error(f"Enter a number between 1 and {len(options)}.")
+            print_error(f"Enter a number between 1 and {len(options)}, B to go back, or Q to quit.")
             continue
         selected = options[int(choice) - 1]
         if selected == f"[ {new_label} ]":
@@ -343,7 +382,7 @@ def get_storage_account(repo_root):
 
 
 # ===========================================================================
-# PRE-FLIGHT CHECKS — check and auto-create all dependencies
+# PRE-FLIGHT CHECKS
 # ===========================================================================
 
 def check_and_create_resource_group(name):
@@ -354,6 +393,8 @@ def check_and_create_resource_group(name):
         return True
     print_missing(f"Resource Group              : {name}")
     location = select_location(f"Location for new resource group '{name}'")
+    if location in (BACK, QUIT):
+        return False
     print_step(f"Creating Resource Group: {name}...")
     ok, _, err = run_command(f'az group create --name "{name}" --location "{location}" --output none')
     if not ok:
@@ -380,6 +421,8 @@ def check_and_create_vnet(vnet_name, resource_group):
         "Valid CIDR format e.g. 10.10.0.0/16",
         default="10.10.0.0/16"
     )
+    if address_prefix in (BACK, QUIT):
+        return False
     print_step(f"Creating VNet: {vnet_name}...")
     ok, _, err = run_command(
         f'az network vnet create --name "{vnet_name}" --resource-group "{resource_group}" '
@@ -409,6 +452,8 @@ def check_and_create_subnet(subnet_name, vnet_name, resource_group):
         "Valid CIDR format e.g. 10.10.1.0/24",
         default="10.10.1.0/24"
     )
+    if address_prefix in (BACK, QUIT):
+        return False
     print_step(f"Creating Subnet: {subnet_name}...")
     ok, _, err = run_command(
         f'az network vnet subnet create --name "{subnet_name}" '
@@ -446,7 +491,6 @@ def check_and_create_dns_zone(zone_name, resource_group):
 
 def check_and_create_dns_link(zone_name, zone_rg, vnet_name, vnet_rg):
     print(f"  Checking DNS VNet Link      : {zone_name} -> {vnet_name}")
-    # Get VNet resource ID
     ok, vnet_id, _ = run_command(
         f'az network vnet show --name "{vnet_name}" '
         f'--resource-group "{vnet_rg}" --query "id" -o tsv'
@@ -455,7 +499,6 @@ def check_and_create_dns_link(zone_name, zone_rg, vnet_name, vnet_rg):
         print_error("Could not get VNet resource ID.")
         return False
     vnet_id = vnet_id.strip().lower()
-    # List all links and check if any already link to this VNet
     ok, out, _ = run_command(
         f'az network private-dns link vnet list '
         f'--resource-group "{zone_rg}" '
@@ -519,6 +562,292 @@ def run_preflight_checks(data):
 
 
 # ===========================================================================
+# STEP-BASED INPUT COLLECTION WITH BACK/QUIT NAVIGATION
+# ===========================================================================
+
+TOTAL_STEPS = 10
+
+def step_environment(data, existing):
+    print_header("Environment", step=1, total=TOTAL_STEPS)
+    result = select_option("Select environment:", ENVIRONMENTS, default=existing.get("environment", "dta"))
+    if result in (BACK, QUIT):
+        return result
+    return {"environment": result}
+
+
+def step_project_details(data, existing):
+    print_header("Project Details", step=2, total=TOTAL_STEPS)
+    project = validate_input(
+        "Project name",
+        r'^[a-z][a-z0-9-]{1,18}[a-z0-9]$',
+        "myapp",
+        "Lowercase letters, numbers and hyphens only. 3-20 chars.",
+        default=existing.get("project"), min_len=3, max_len=20
+    )
+    if project in (BACK, QUIT):
+        return project
+
+    server_name = validate_input(
+        "Server name (must be globally unique across all of Azure)",
+        r'^[a-z][a-z0-9-]{1,61}[a-z0-9]$',
+        f"psql-{project}-{data.get('environment','dta')}-001",
+        "Lowercase letters, numbers and hyphens only. 3-63 chars.",
+        default=existing.get("server_name"), min_len=3, max_len=63
+    )
+    if server_name in (BACK, QUIT):
+        return server_name
+
+    return {"project": project, "server_name": server_name}
+
+
+def step_resource_group(data, existing):
+    print_header("Resource Group for PostgreSQL Server", step=3, total=TOTAL_STEPS)
+    pg_rg = select_resource_group(
+        "PostgreSQL server resource group (select existing or create new)",
+        default=existing.get("pg_resource_group_name")
+    )
+    if pg_rg in (BACK, QUIT):
+        return pg_rg
+    return {"pg_resource_group_name": pg_rg}
+
+
+def step_networking(data, existing):
+    print_header("Networking", step=4, total=TOTAL_STEPS)
+
+    vnet_rg = select_resource_group(
+        "VNet resource group (select existing or create new)",
+        default=existing.get("vnet_resource_group_name")
+    )
+    if vnet_rg in (BACK, QUIT):
+        return vnet_rg
+
+    vnet_name = select_vnet(vnet_rg, default=existing.get("vnet_name"))
+    if vnet_name in (BACK, QUIT):
+        return vnet_name
+
+    pe_subnet = select_subnet(vnet_name, vnet_rg, default=existing.get("pe_subnet_name"))
+    if pe_subnet in (BACK, QUIT):
+        return pe_subnet
+
+    dns_rg = select_resource_group(
+        "Private DNS zone resource group (select existing or create new)",
+        default=existing.get("private_dns_zone_resource_group_name")
+    )
+    if dns_rg in (BACK, QUIT):
+        return dns_rg
+
+    return {
+        "vnet_resource_group_name":             vnet_rg,
+        "vnet_name":                            vnet_name,
+        "pe_subnet_name":                       pe_subnet,
+        "private_dns_zone_resource_group_name": dns_rg,
+        "private_dns_zone_name":                DNS_ZONE_NAME,
+    }
+
+
+def step_postgresql_server(data, existing):
+    print_header("PostgreSQL Server", step=5, total=TOTAL_STEPS)
+
+    pg_version = select_option("PostgreSQL version:", PG_VERSIONS, default=existing.get("pg_version", 16))
+    if pg_version in (BACK, QUIT):
+        return pg_version
+
+    tier = select_option("SKU tier:", list(SKU_OPTIONS.keys()), default="GeneralPurpose")
+    if tier in (BACK, QUIT):
+        return tier
+
+    pg_sku = select_option("SKU size:", SKU_OPTIONS[tier], default=existing.get("pg_sku_name"))
+    if pg_sku in (BACK, QUIT):
+        return pg_sku
+
+    pg_storage = select_option("Storage size:", STORAGE_OPTIONS, default=existing.get("pg_storage_mb", 32768))
+    if pg_storage in (BACK, QUIT):
+        return pg_storage
+
+    pg_zone = select_option("Availability zone:", ZONES, default=existing.get("pg_zone", 1))
+    if pg_zone in (BACK, QUIT):
+        return pg_zone
+
+    pg_auto_grow = confirm("Enable storage auto-grow? (recommended for prod)", default="n")
+    if pg_auto_grow in (BACK, QUIT):
+        return pg_auto_grow
+
+    return {
+        "pg_version":           pg_version,
+        "pg_sku_name":          pg_sku,
+        "pg_storage_mb":        pg_storage,
+        "pg_zone":              pg_zone,
+        "pg_auto_grow_enabled": pg_auto_grow,
+    }
+
+
+def step_administrator(data, existing):
+    print_header("Administrator", step=6, total=TOTAL_STEPS)
+    admin_login = validate_input(
+        "Admin login username",
+        r'^[a-zA-Z][a-zA-Z0-9_]{1,62}$',
+        "psqladmin",
+        "Letters, numbers and underscores. Must start with a letter. 2-63 chars.",
+        default=existing.get("pg_admin_login", "psqladmin"), min_len=2, max_len=63
+    )
+    if admin_login in (BACK, QUIT):
+        return admin_login
+    return {"pg_admin_login": admin_login}
+
+
+def step_backup(data, existing):
+    print_header("Backup", step=7, total=TOTAL_STEPS)
+
+    retention = input_number("Backup retention days", 7, 35, default=existing.get("pg_backup_retention_days", 7))
+    if retention in (BACK, QUIT):
+        return retention
+
+    geo = confirm("Enable geo-redundant backup? (recommended for prod)", default="n")
+    if geo in (BACK, QUIT):
+        return geo
+
+    return {
+        "pg_backup_retention_days":        retention,
+        "pg_geo_redundant_backup_enabled": geo,
+    }
+
+
+def step_maintenance(data, existing):
+    print_header("Maintenance Window", step=8, total=TOTAL_STEPS)
+
+    day_name = select_option(
+        "Maintenance day:", DAYS_OF_WEEK,
+        default=DAYS_OF_WEEK[existing.get("maintenance_day", 0)]
+    )
+    if day_name in (BACK, QUIT):
+        return day_name
+
+    hour = input_number("Maintenance start hour (UTC)", 0, 23, default=existing.get("maintenance_hour", 2))
+    if hour in (BACK, QUIT):
+        return hour
+
+    minute = select_option("Maintenance start minute:", START_MINUTES, default=existing.get("maintenance_minute", 0))
+    if minute in (BACK, QUIT):
+        return minute
+
+    return {
+        "maintenance_day":    DAYS_OF_WEEK.index(day_name),
+        "maintenance_hour":   hour,
+        "maintenance_minute": minute,
+    }
+
+
+def step_high_availability(data, existing):
+    print_header("High Availability", step=9, total=TOTAL_STEPS)
+
+    ha_enabled = confirm("Enable Zone-Redundant High Availability? (recommended for prod)", default="n")
+    if ha_enabled in (BACK, QUIT):
+        return ha_enabled
+
+    if ha_enabled:
+        available_zones = [z for z in ZONES if z != data.get("pg_zone", 1)]
+        standby_zone = select_option(
+            "Standby availability zone (must differ from primary):",
+            available_zones, default=available_zones[0]
+        )
+        if standby_zone in (BACK, QUIT):
+            return standby_zone
+    else:
+        standby_zone = 2 if data.get("pg_zone", 1) != 2 else 3
+
+    return {"pg_ha_enabled": ha_enabled, "pg_ha_standby_zone": standby_zone}
+
+
+def step_databases(data, existing):
+    print_header("Databases", step=10, total=TOTAL_STEPS)
+    databases = collect_databases(existing=existing.get("databases"))
+    if databases in (BACK, QUIT):
+        return databases
+    return {"databases": databases}
+
+
+def collect_inputs(subscription_id, tenant_id, existing=None):
+    """Run all steps with full back/quit navigation."""
+    e = existing or {}
+    data = {
+        "subscription_id": subscription_id,
+        "tenant_id":       tenant_id,
+    }
+
+    steps = [
+        step_environment,
+        step_project_details,
+        step_resource_group,
+        step_networking,
+        step_postgresql_server,
+        step_administrator,
+        step_backup,
+        step_maintenance,
+        step_high_availability,
+        step_databases,
+    ]
+
+    i = 0
+    while i < len(steps):
+        result = steps[i](data, e)
+
+        if result == QUIT:
+            print("\n  Cancelled — returning to main menu.")
+            return QUIT
+
+        if result == BACK:
+            if i == 0:
+                print("\n  Already at first step — returning to main menu.")
+                return QUIT
+            # Drop keys that the previous step collected
+            prev_result = steps[i - 1](data, e)
+            # Just go back without collecting — clear that step's keys
+            i -= 1
+            continue
+
+        data.update(result)
+        i += 1
+
+    return data
+
+
+def print_summary(data):
+    print_header("SUMMARY — Please review before proceeding")
+    print(f"""
+  Environment     : {data['environment']}
+  Project         : {data['project']}
+  Server name     : {data['server_name']}
+
+  Resource Group  : {data['pg_resource_group_name']}
+  VNet RG         : {data['vnet_resource_group_name']}
+  VNet            : {data['vnet_name']}
+  PE Subnet       : {data['pe_subnet_name']}
+  DNS Zone RG     : {data['private_dns_zone_resource_group_name']}
+  DNS Zone        : {data['private_dns_zone_name']}
+
+  PG Version      : {data['pg_version']}
+  SKU             : {data['pg_sku_name']}
+  Storage         : {data['pg_storage_mb']} MB
+  Zone            : {data['pg_zone']}
+  Auto Grow       : {data['pg_auto_grow_enabled']}
+  Admin Login     : {data['pg_admin_login']}
+
+  Backup Days     : {data['pg_backup_retention_days']}
+  Geo Redundant   : {data['pg_geo_redundant_backup_enabled']}
+
+  Maintenance     : {DAYS_OF_WEEK[data['maintenance_day']]} {data['maintenance_hour']:02d}:{data['maintenance_minute']:02d} UTC
+
+  HA Enabled      : {data['pg_ha_enabled']}
+  HA Standby Zone : {data['pg_ha_standby_zone']}
+
+  Databases       : {', '.join(data['databases'].keys())}
+
+  Subscription ID : {data['subscription_id']}
+  Tenant ID       : {data['tenant_id']}
+    """)
+
+
+# ===========================================================================
 # POST-MERGE DEPLOY
 # ===========================================================================
 
@@ -574,7 +903,8 @@ def post_merge_deploy(repo_root, server_name, environment, action):
         print_error("terraform plan failed.")
         return
 
-    if not confirm("Plan looks good. Apply now?", default="n"):
+    proceed = confirm("Plan looks good. Apply now?", default="n")
+    if proceed in (BACK, QUIT) or not proceed:
         print("\n  Apply cancelled. Run manually when ready:")
         print(f"    cd environments/{environment}/{server_name}")
         print(f"    terraform apply -var-file=\"terraform.tfvars\"")
@@ -824,7 +1154,11 @@ variable "pg_maintenance_window" {
     start_hour   = number
     start_minute = number
   })
-  default = { day_of_week = 0; start_hour = 2; start_minute = 0 }
+  default = {
+    day_of_week  = 0
+    start_hour   = 2
+    start_minute = 0
+  }
 }
 
 variable "pg_ha_enabled"      { type = bool;   default = false }
@@ -997,167 +1331,6 @@ def list_servers(repo_root):
 
 
 # ===========================================================================
-# INPUT COLLECTION
-# ===========================================================================
-
-def collect_inputs(subscription_id, tenant_id, existing=None):
-    e = existing or {}
-    data = {}
-    data["subscription_id"] = subscription_id
-    data["tenant_id"]       = tenant_id
-
-    print_header("Environment")
-    data["environment"] = select_option(
-        "Select environment:", ENVIRONMENTS, default=e.get("environment", "dta")
-    )
-
-    print_header("Project Details")
-    data["project"] = validate_input(
-        "Project name",
-        r'^[a-z][a-z0-9-]{1,18}[a-z0-9]$',
-        "myapp",
-        "Lowercase letters, numbers and hyphens only. 3-20 chars.",
-        default=e.get("project"), min_len=3, max_len=20
-    )
-    data["server_name"] = validate_input(
-        "Server name (must be globally unique across all of Azure)",
-        r'^[a-z][a-z0-9-]{1,61}[a-z0-9]$',
-        f"psql-myapp-{data.get('environment','dta')}-001",
-        "Lowercase letters, numbers and hyphens only. 3-63 chars.",
-        default=e.get("server_name"), min_len=3, max_len=63
-    )
-
-    print_header("Resource Group for PostgreSQL Server")
-    data["pg_resource_group_name"] = select_resource_group(
-        "PostgreSQL server resource group (select existing or create new)",
-        default=e.get("pg_resource_group_name")
-    )
-
-    print_header("Networking")
-    data["vnet_resource_group_name"] = select_resource_group(
-        "VNet resource group (select existing or create new)",
-        default=e.get("vnet_resource_group_name")
-    )
-    data["vnet_name"] = select_vnet(
-        data["vnet_resource_group_name"],
-        default=e.get("vnet_name")
-    )
-    data["pe_subnet_name"] = select_subnet(
-        data["vnet_name"],
-        data["vnet_resource_group_name"],
-        default=e.get("pe_subnet_name")
-    )
-    data["private_dns_zone_resource_group_name"] = select_resource_group(
-        "Private DNS zone resource group (select existing or create new)",
-        default=e.get("private_dns_zone_resource_group_name")
-    )
-    data["private_dns_zone_name"] = DNS_ZONE_NAME
-
-    print_header("PostgreSQL Server")
-    data["pg_version"] = select_option(
-        "PostgreSQL version:", PG_VERSIONS, default=e.get("pg_version", 16)
-    )
-    tier = select_option(
-        "SKU tier:", list(SKU_OPTIONS.keys()), default="GeneralPurpose"
-    )
-    data["pg_sku_name"] = select_option(
-        "SKU size:", SKU_OPTIONS[tier], default=e.get("pg_sku_name")
-    )
-    data["pg_storage_mb"] = select_option(
-        "Storage size:", STORAGE_OPTIONS, default=e.get("pg_storage_mb", 32768)
-    )
-    data["pg_zone"] = select_option(
-        "Availability zone:", ZONES, default=e.get("pg_zone", 1)
-    )
-    data["pg_auto_grow_enabled"] = confirm(
-        "Enable storage auto-grow? (recommended for prod)", default="n"
-    )
-
-    print_header("Administrator")
-    data["pg_admin_login"] = validate_input(
-        "Admin login username",
-        r'^[a-zA-Z][a-zA-Z0-9_]{1,62}$',
-        "psqladmin",
-        "Letters, numbers and underscores. Must start with a letter. 2-63 chars.",
-        default=e.get("pg_admin_login", "psqladmin"), min_len=2, max_len=63
-    )
-
-    print_header("Backup")
-    data["pg_backup_retention_days"] = input_number(
-        "Backup retention days", 7, 35, default=e.get("pg_backup_retention_days", 7)
-    )
-    data["pg_geo_redundant_backup_enabled"] = confirm(
-        "Enable geo-redundant backup? (recommended for prod)", default="n"
-    )
-
-    print_header("Maintenance Window")
-    day_name = select_option(
-        "Maintenance day:", DAYS_OF_WEEK,
-        default=DAYS_OF_WEEK[e.get("maintenance_day", 0)]
-    )
-    data["maintenance_day"]    = DAYS_OF_WEEK.index(day_name)
-    data["maintenance_hour"]   = input_number(
-        "Maintenance start hour (UTC)", 0, 23, default=e.get("maintenance_hour", 2)
-    )
-    data["maintenance_minute"] = select_option(
-        "Maintenance start minute:", START_MINUTES, default=e.get("maintenance_minute", 0)
-    )
-
-    print_header("High Availability")
-    data["pg_ha_enabled"] = confirm(
-        "Enable Zone-Redundant High Availability? (recommended for prod)", default="n"
-    )
-    if data["pg_ha_enabled"]:
-        available_zones = [z for z in ZONES if z != data["pg_zone"]]
-        data["pg_ha_standby_zone"] = select_option(
-            "Standby availability zone:", available_zones, default=available_zones[0]
-        )
-    else:
-        data["pg_ha_standby_zone"] = 2 if data["pg_zone"] != 2 else 3
-
-    print_header("Databases")
-    data["databases"] = collect_databases(existing=e.get("databases"))
-
-    return data
-
-
-def print_summary(data):
-    print_header("SUMMARY — Please review before proceeding")
-    print(f"""
-  Environment     : {data['environment']}
-  Project         : {data['project']}
-  Server name     : {data['server_name']}
-
-  Resource Group  : {data['pg_resource_group_name']}
-  VNet RG         : {data['vnet_resource_group_name']}
-  VNet            : {data['vnet_name']}
-  PE Subnet       : {data['pe_subnet_name']}
-  DNS Zone RG     : {data['private_dns_zone_resource_group_name']}
-  DNS Zone        : {data['private_dns_zone_name']}
-
-  PG Version      : {data['pg_version']}
-  SKU             : {data['pg_sku_name']}
-  Storage         : {data['pg_storage_mb']} MB
-  Zone            : {data['pg_zone']}
-  Auto Grow       : {data['pg_auto_grow_enabled']}
-  Admin Login     : {data['pg_admin_login']}
-
-  Backup Days     : {data['pg_backup_retention_days']}
-  Geo Redundant   : {data['pg_geo_redundant_backup_enabled']}
-
-  Maintenance     : {DAYS_OF_WEEK[data['maintenance_day']]} {data['maintenance_hour']:02d}:{data['maintenance_minute']:02d} UTC
-
-  HA Enabled      : {data['pg_ha_enabled']}
-  HA Standby Zone : {data['pg_ha_standby_zone']}
-
-  Databases       : {', '.join(data['databases'].keys())}
-
-  Subscription ID : {data['subscription_id']}
-  Tenant ID       : {data['tenant_id']}
-    """)
-
-
-# ===========================================================================
 # FLOWS
 # ===========================================================================
 
@@ -1168,9 +1341,13 @@ def create_server(repo_root, repo_slug):
     storage_account = get_storage_account(repo_root)
 
     data = collect_inputs(subscription_id, tenant_id)
+    if data == QUIT:
+        return
+
     print_summary(data)
 
-    if not confirm("Proceed with these settings?", default="n"):
+    proceed = confirm("Proceed with these settings?", default="n")
+    if proceed in (BACK, QUIT) or not proceed:
         print("\n  Cancelled.")
         return
 
@@ -1184,8 +1361,44 @@ def create_server(repo_root, repo_slug):
     branch_name = f"add/{server_name}"
 
     if server_path.exists():
-        print_error(f"Server folder already exists: {server_path}")
-        return
+        # Auto-generate next available name e.g. wm-testpaas-dta-002, -003
+        base = server_name
+        # Strip trailing -NNN if present and find next number
+        match = re.match(r'^(.*-)([0-9]+)$', base)
+        if match:
+            prefix, num = match.group(1), int(match.group(2))
+        else:
+            prefix, num = base + "-", 1
+        counter = num + 1
+        while (repo_root / "environments" / environment / f"{prefix}{counter:03d}").exists():
+            counter += 1
+        suggested = f"{prefix}{counter:03d}"
+
+        print(f"\n  Server folder already exists: environments/{environment}/{server_name}")
+        print(f"    1) Save as new name : {suggested}")
+        print(f"    2) Overwrite existing")
+        print(f"    3) Cancel  (default)")
+        print(f"    B) Go back")
+        print(f"    Q) Quit")
+        while True:
+            choice = nav_input("  Enter choice [1/2/3]: ")
+            if choice in (BACK, QUIT):
+                return
+            if choice == "" or choice == "3":
+                print("\n  Cancelled.")
+                return
+            if choice == "1":
+                server_name = suggested
+                server_path = repo_root / "environments" / environment / server_name
+                branch_name = f"add/{server_name}"
+                data["server_name"] = server_name
+                print_success(f"Using new name: {server_name}")
+                break
+            if choice == "2":
+                shutil.rmtree(server_path)
+                print_success("Existing folder removed. Continuing...")
+                break
+            print_error("Enter 1, 2, 3, B or Q.")
 
     git_pull(repo_root)
     git_create_branch(repo_root, branch_name)
@@ -1215,6 +1428,8 @@ def modify_server(repo_root, repo_slug):
 
     options = [f"{env}/{name}" for env, name, _ in servers]
     selected = select_option("Select server to modify:", options)
+    if selected in (BACK, QUIT):
+        return
     env, name = selected.split("/")
     server_path = repo_root / "environments" / env / name
 
@@ -1235,7 +1450,9 @@ def modify_server(repo_root, repo_slug):
     """)
 
     while True:
-        choice = input("  Enter choice [1-9]: ").strip()
+        choice = nav_input("  Enter choice [1-9]: ")
+        if choice in (BACK, QUIT):
+            return
         if choice in [str(i) for i in range(1, 10)]:
             break
         print_error("Enter a number between 1 and 9.")
@@ -1252,40 +1469,72 @@ def modify_server(repo_root, repo_slug):
     if choice in ["1", "8"]:
         print_header("SKU")
         tier = select_option("SKU tier:", list(SKU_OPTIONS.keys()), default="GeneralPurpose")
-        data["pg_sku_name"] = select_option("SKU size:", SKU_OPTIONS[tier], default=existing.get("pg_sku_name"))
+        if tier in (BACK, QUIT):
+            return
+        sku = select_option("SKU size:", SKU_OPTIONS[tier], default=existing.get("pg_sku_name"))
+        if sku in (BACK, QUIT):
+            return
+        data["pg_sku_name"] = sku
 
     if choice in ["2", "8"]:
         print_header("Storage")
-        data["pg_storage_mb"] = select_option("Storage size:", STORAGE_OPTIONS, default=existing.get("pg_storage_mb", 32768))
+        storage = select_option("Storage size:", STORAGE_OPTIONS, default=existing.get("pg_storage_mb", 32768))
+        if storage in (BACK, QUIT):
+            return
+        data["pg_storage_mb"] = storage
 
     if choice in ["3", "8"]:
         print_header("Backup Retention")
-        data["pg_backup_retention_days"] = input_number("Backup retention days", 7, 35, default=existing.get("pg_backup_retention_days", 7))
+        retention = input_number("Backup retention days", 7, 35, default=existing.get("pg_backup_retention_days", 7))
+        if retention in (BACK, QUIT):
+            return
+        data["pg_backup_retention_days"] = retention
 
     if choice in ["4", "8"]:
         print_header("Geo Redundant Backup")
-        data["pg_geo_redundant_backup_enabled"] = confirm("Enable geo-redundant backup?", default="n")
+        geo = confirm("Enable geo-redundant backup?", default="n")
+        if geo in (BACK, QUIT):
+            return
+        data["pg_geo_redundant_backup_enabled"] = geo
 
     if choice in ["5", "8"]:
         print_header("Maintenance Window")
         day_name = select_option("Maintenance day:", DAYS_OF_WEEK, default=DAYS_OF_WEEK[existing.get("maintenance_day", 0)])
+        if day_name in (BACK, QUIT):
+            return
+        hour = input_number("Maintenance start hour (UTC)", 0, 23, default=existing.get("maintenance_hour", 2))
+        if hour in (BACK, QUIT):
+            return
+        minute = select_option("Maintenance start minute:", START_MINUTES, default=existing.get("maintenance_minute", 0))
+        if minute in (BACK, QUIT):
+            return
         data["maintenance_day"]    = DAYS_OF_WEEK.index(day_name)
-        data["maintenance_hour"]   = input_number("Maintenance start hour (UTC)", 0, 23, default=existing.get("maintenance_hour", 2))
-        data["maintenance_minute"] = select_option("Maintenance start minute:", START_MINUTES, default=existing.get("maintenance_minute", 0))
+        data["maintenance_hour"]   = hour
+        data["maintenance_minute"] = minute
 
     if choice in ["6", "8"]:
         print_header("High Availability")
-        data["pg_ha_enabled"] = confirm("Enable Zone-Redundant High Availability?", default="n")
-        if data["pg_ha_enabled"]:
+        ha = confirm("Enable Zone-Redundant High Availability?", default="n")
+        if ha in (BACK, QUIT):
+            return
+        data["pg_ha_enabled"] = ha
+        if ha:
             available_zones = [z for z in ZONES if z != data.get("pg_zone", 1)]
-            data["pg_ha_standby_zone"] = select_option("Standby zone:", available_zones, default=available_zones[0])
+            standby = select_option("Standby zone:", available_zones, default=available_zones[0])
+            if standby in (BACK, QUIT):
+                return
+            data["pg_ha_standby_zone"] = standby
 
     if choice in ["7", "8"]:
         print_header("Databases")
-        data["databases"] = collect_databases(existing=existing.get("databases"))
+        dbs = collect_databases(existing=existing.get("databases"))
+        if dbs in (BACK, QUIT):
+            return
+        data["databases"] = dbs
 
     print_summary(data)
-    if not confirm("Proceed with these changes?", default="n"):
+    proceed = confirm("Proceed with these changes?", default="n")
+    if proceed in (BACK, QUIT) or not proceed:
         print("\n  Cancelled.")
         return
 
@@ -1312,6 +1561,8 @@ def delete_server(repo_root, repo_slug):
 
     options = [f"{env}/{name}" for env, name, _ in servers]
     selected = select_option("Select server to delete:", options)
+    if selected in (BACK, QUIT):
+        return
     env, name = selected.split("/")
     server_path = repo_root / "environments" / env / name
 
@@ -1324,12 +1575,15 @@ def delete_server(repo_root, repo_slug):
     """)
 
     print("  To confirm, type the server name exactly:")
-    confirm_name = input("  Server name: ").strip()
+    confirm_name = nav_input("  Server name: ")
+    if confirm_name in (BACK, QUIT):
+        return
     if confirm_name != name:
         print_error(f"Name does not match. Expected: {name}")
         return
 
-    if not confirm(f"Are you absolutely sure you want to delete {name}?", default="n"):
+    proceed = confirm(f"Are you absolutely sure you want to delete {name}?", default="n")
+    if proceed in (BACK, QUIT) or not proceed:
         print("\n  Cancelled.")
         return
 
