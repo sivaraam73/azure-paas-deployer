@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 paas-deployer.py — PostgreSQL Flexible Server Manager
-Automates branch creation, tfvars generation, and GitHub PR workflow.
+Automates pre-flight checks, branch creation, tfvars generation, and GitHub PR workflow.
 """
 
 import os
@@ -9,6 +9,7 @@ import re
 import sys
 import json
 import shutil
+import getpass
 import subprocess
 from pathlib import Path
 
@@ -52,14 +53,15 @@ STORAGE_OPTIONS = [
     (4194304, "  4 TB"),
 ]
 
-PG_VERSIONS  = [14, 15, 16, 17]
-ZONES        = [1, 2, 3]
-ENVIRONMENTS = ["dta", "prod"]
-DAYS_OF_WEEK = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
+PG_VERSIONS   = [14, 15, 16, 17]
+ZONES         = [1, 2, 3]
+ENVIRONMENTS  = ["dta", "prod"]
+DAYS_OF_WEEK  = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
 START_MINUTES = [0, 30]
+DNS_ZONE_NAME = "privatelink.postgres.database.azure.com"
 
 # ===========================================================================
-# HELPERS
+# DISPLAY HELPERS
 # ===========================================================================
 
 def clear_screen():
@@ -84,67 +86,13 @@ def print_error(msg):
     print(f"  [ERROR] {msg}")
 
 
-def run_command(cmd, cwd=None):
-    result = subprocess.run(
-        cmd, shell=True, cwd=cwd,
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-    )
-    return result.returncode == 0, result.stdout.strip(), result.stderr.strip()
+def print_missing(msg):
+    print(f"  [MISSING] {msg}")
 
 
-def get_repo_root():
-    """Use the directory where paas-deployer.py lives as the repo root."""
-    root = Path(__file__).parent.resolve()
-    if not (root / "environments").exists() or not (root / "_template").exists():
-        print_error("Could not find environments/ and _template/ folders.")
-        print("  Make sure paas-deployer.py is in the root of the repo.")
-        sys.exit(1)
-    return root
-
-
-def get_az_account():
-    print_step("Reading Azure account details...")
-    ok, out, err = run_command("az account show --output json")
-    if not ok:
-        print_error("Failed to read Azure account. Are you logged in via 'az login'?")
-        sys.exit(1)
-    data = json.loads(out)
-    subscription_id = data["id"]
-    tenant_id       = data["tenantId"]
-    print_success(f"Subscription : {subscription_id}")
-    print_success(f"Tenant       : {tenant_id}")
-    return subscription_id, tenant_id
-
-
-def get_github_remote(repo_root):
-    ok, out, _ = run_command("git remote get-url origin", cwd=repo_root)
-    if not ok or not out:
-        print_error("Could not determine GitHub remote URL.")
-        sys.exit(1)
-    match = re.search(r'[:/]([^:/]+/[^/]+?)(?:\.git)?$', out)
-    if not match:
-        print_error(f"Could not parse remote URL: {out}")
-        sys.exit(1)
-    return match.group(1)
-
-
-def get_storage_account(repo_root):
-    for env_dir in (repo_root / "environments").iterdir():
-        if not env_dir.is_dir():
-            continue
-        for server_dir in env_dir.iterdir():
-            tf = server_dir / "00_global.tf"
-            if tf.exists():
-                m = re.search(r'storage_account_name\s*=\s*"([^"]+)"', tf.read_text())
-                if m:
-                    return m.group(1)
-    tf = repo_root / "_template" / "00_global.tf"
-    if tf.exists():
-        m = re.search(r'storage_account_name\s*=\s*"([^"]+)"', tf.read_text())
-        if m:
-            return m.group(1)
-    return "stttfstatesiva001"
-
+# ===========================================================================
+# INPUT HELPERS
+# ===========================================================================
 
 def validate_input(prompt, pattern, example, error_msg, default=None, min_len=1, max_len=100):
     default_hint = f" (default={default})" if default is not None else ""
@@ -241,18 +189,359 @@ def collect_databases(existing=None):
         if not re.match(r'^[a-z][a-z0-9_-]{1,62}$', name):
             print_error("Lowercase letters, numbers, hyphens or underscores. Min 2 chars.")
             continue
-        databases[name] = {
-            "name":      name,
-            "charset":   "UTF8",
-            "collation": "en_US.utf8"
-        }
+        databases[name] = {"name": name, "charset": "UTF8", "collation": "en_US.utf8"}
         print_success(f"Added: {name}")
     return databases
 
 
 # ===========================================================================
+# AZURE CLI HELPERS
+# ===========================================================================
+
+def run_command(cmd, cwd=None):
+    result = subprocess.run(
+        cmd, shell=True, cwd=cwd,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+    )
+    return result.returncode == 0, result.stdout.strip(), result.stderr.strip()
+
+
+def get_az_account():
+    print_step("Reading Azure account details...")
+    ok, out, err = run_command("az account show --output json")
+    if not ok:
+        print_error("Failed to read Azure account. Are you logged in via 'az login'?")
+        sys.exit(1)
+    data = json.loads(out)
+    subscription_id = data["id"]
+    tenant_id       = data["tenantId"]
+    print_success(f"Subscription : {subscription_id}")
+    print_success(f"Tenant       : {tenant_id}")
+    return subscription_id, tenant_id
+
+
+def get_rg_location(resource_group):
+    ok, out, _ = run_command(f'az group show --name "{resource_group}" --query "location" -o tsv')
+    return out.strip() if ok else None
+
+
+# ===========================================================================
+# PRE-FLIGHT CHECKS — check and auto-create all dependencies
+# ===========================================================================
+
+def check_and_create_resource_group(name):
+    print(f"  Checking Resource Group     : {name}")
+    ok, _, _ = run_command(f'az group show --name "{name}" --output none 2>/dev/null')
+    if ok:
+        print_success(f"Resource Group exists       : {name}")
+        return True
+
+    print_missing(f"Resource Group              : {name}")
+    print("\n  Location for new resource group:")
+    print("  Example : malaysiawest, southeastasia, eastus")
+    location = validate_input(
+        "Location",
+        r'^[a-z][a-z0-9]+$',
+        "malaysiawest",
+        "Lowercase letters and numbers only.",
+        default="malaysiawest",
+        min_len=3, max_len=50
+    )
+    print_step(f"Creating Resource Group: {name}...")
+    ok, _, err = run_command(f'az group create --name "{name}" --location "{location}" --output none')
+    if not ok:
+        print_error(f"Failed: {err}")
+        return False
+    print_success(f"Resource Group created      : {name}")
+    return True
+
+
+def check_and_create_vnet(vnet_name, resource_group):
+    print(f"  Checking VNet               : {vnet_name}")
+    ok, _, _ = run_command(
+        f'az network vnet show --name "{vnet_name}" --resource-group "{resource_group}" --output none 2>/dev/null'
+    )
+    if ok:
+        print_success(f"VNet exists                 : {vnet_name}")
+        return True
+
+    print_missing(f"VNet                        : {vnet_name}")
+    location = get_rg_location(resource_group) or "malaysiawest"
+    address_prefix = validate_input(
+        "VNet address prefix",
+        r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}/\d{1,2}$',
+        "10.10.0.0/16",
+        "Valid CIDR format e.g. 10.10.0.0/16",
+        default="10.10.0.0/16"
+    )
+    print_step(f"Creating VNet: {vnet_name}...")
+    ok, _, err = run_command(
+        f'az network vnet create --name "{vnet_name}" --resource-group "{resource_group}" '
+        f'--location "{location}" --address-prefix "{address_prefix}" --output none'
+    )
+    if not ok:
+        print_error(f"Failed: {err}")
+        return False
+    print_success(f"VNet created                : {vnet_name}")
+    return True
+
+
+def check_and_create_subnet(subnet_name, vnet_name, resource_group):
+    print(f"  Checking Subnet             : {subnet_name}")
+    ok, _, _ = run_command(
+        f'az network vnet subnet show --name "{subnet_name}" '
+        f'--vnet-name "{vnet_name}" --resource-group "{resource_group}" --output none 2>/dev/null'
+    )
+    if ok:
+        print_success(f"Subnet exists               : {subnet_name}")
+        return True
+
+    print_missing(f"Subnet                      : {subnet_name}")
+    address_prefix = validate_input(
+        "Subnet address prefix",
+        r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}/\d{1,2}$',
+        "10.10.1.0/24",
+        "Valid CIDR format e.g. 10.10.1.0/24",
+        default="10.10.1.0/24"
+    )
+    print_step(f"Creating Subnet: {subnet_name}...")
+    ok, _, err = run_command(
+        f'az network vnet subnet create --name "{subnet_name}" '
+        f'--vnet-name "{vnet_name}" --resource-group "{resource_group}" '
+        f'--address-prefix "{address_prefix}" --output none'
+    )
+    if not ok:
+        print_error(f"Failed: {err}")
+        return False
+    print_success(f"Subnet created              : {subnet_name}")
+    return True
+
+
+def check_and_create_dns_zone(zone_name, resource_group):
+    print(f"  Checking Private DNS Zone   : {zone_name}")
+    ok, _, _ = run_command(
+        f'az network private-dns zone show --name "{zone_name}" '
+        f'--resource-group "{resource_group}" --output none 2>/dev/null'
+    )
+    if ok:
+        print_success(f"Private DNS Zone exists     : {zone_name}")
+        return True
+
+    print_missing(f"Private DNS Zone            : {zone_name}")
+    print_step(f"Creating Private DNS Zone: {zone_name}...")
+    ok, _, err = run_command(
+        f'az network private-dns zone create --name "{zone_name}" '
+        f'--resource-group "{resource_group}" --output none'
+    )
+    if not ok:
+        print_error(f"Failed: {err}")
+        return False
+    print_success(f"Private DNS Zone created    : {zone_name}")
+    return True
+
+
+def check_and_create_dns_link(zone_name, zone_rg, vnet_name, vnet_rg):
+    link_name = f"dns-link-{vnet_name}"
+    print(f"  Checking DNS VNet Link      : {zone_name} -> {vnet_name}")
+
+    # Get VNet resource ID first
+    ok2, vnet_id, _ = run_command(
+        f'az network vnet show --name "{vnet_name}" '
+        f'--resource-group "{vnet_rg}" --query "id" -o tsv'
+    )
+    if not ok2:
+        print_error("Could not get VNet resource ID.")
+        return False
+
+    # Check if ANY link already exists between this zone and this VNet
+    ok, out, _ = run_command(
+        f'az network private-dns link vnet list '
+        f'--resource-group "{zone_rg}" '
+        f'--zone-name "{zone_name}" '
+        f'--query "[?virtualNetwork.id==\'{vnet_id}\'].name" -o tsv'
+    )
+    if ok and out.strip():
+        print_success(f"DNS VNet Link exists        : {out.strip()}")
+        return True
+
+    print_missing(f"DNS VNet Link               : {link_name}")
+    print_step(f"Creating DNS VNet Link: {link_name}...")
+    ok, _, err = run_command(
+        f'az network private-dns link vnet create '
+        f'--name "{link_name}" '
+        f'--resource-group "{zone_rg}" '
+        f'--zone-name "{zone_name}" '
+        f'--virtual-network "{vnet_id}" '
+        f'--registration-enabled false '
+        f'--output none'
+    )
+    if not ok:
+        print_error(f"Failed: {err}")
+        return False
+    print_success(f"DNS VNet Link created       : {link_name}")
+    return True
+
+
+def run_preflight_checks(data):
+    """Check and auto-create all Azure dependencies before deploying."""
+    print_header("PRE-FLIGHT DEPENDENCY CHECKS")
+
+    # Collect unique resource groups to check
+    rgs = list(dict.fromkeys([
+        data["pg_resource_group_name"],
+        data["vnet_resource_group_name"],
+        data["private_dns_zone_resource_group_name"],
+    ]))
+
+    for rg in rgs:
+        if not check_and_create_resource_group(rg):
+            return False
+
+    if not check_and_create_vnet(data["vnet_name"], data["vnet_resource_group_name"]):
+        return False
+
+    if not check_and_create_subnet(data["pe_subnet_name"], data["vnet_name"], data["vnet_resource_group_name"]):
+        return False
+
+    if not check_and_create_dns_zone(DNS_ZONE_NAME, data["private_dns_zone_resource_group_name"]):
+        return False
+
+    if not check_and_create_dns_link(
+        DNS_ZONE_NAME,
+        data["private_dns_zone_resource_group_name"],
+        data["vnet_name"],
+        data["vnet_resource_group_name"]
+    ):
+        return False
+
+    print_success("All dependencies are ready.")
+    return True
+
+
+# ===========================================================================
+# POST-MERGE DEPLOY
+# ===========================================================================
+
+def post_merge_deploy(repo_root, server_name, environment, action):
+    if action == "delete":
+        print("\n  After PR is merged, remember to:")
+        print(f"    1. Remove the Azure resource lock for {server_name}")
+        print(f"    2. cd environments/{environment}/{server_name}")
+        print(f"    3. export TF_VAR_pg_admin_password='YourPassword'")
+        print(f"    4. terraform destroy -var-file=\"terraform.tfvars\"")
+        return
+
+    if not confirm("Have you merged the PR?", default="n"):
+        print("\n  Run terraform manually when ready:")
+        print(f"    cd environments/{environment}/{server_name}")
+        print(f"    export TF_VAR_pg_admin_password='YourPassword'")
+        if action == "create":
+            print(f"    terraform init")
+        print(f"    terraform apply -var-file=\"terraform.tfvars\"")
+        return
+
+    print_step("Pulling merged changes from main...")
+    ok, _, err = run_command("git checkout main", cwd=repo_root)
+    if not ok:
+        print_error(f"Failed to checkout main: {err}")
+        return
+    ok, _, err = run_command("git pull origin main", cwd=repo_root)
+    if not ok:
+        print_error(f"Failed to pull: {err}")
+        return
+    print_success("Up to date with main.")
+
+    server_path = repo_root / "environments" / environment / server_name
+
+    print("\n  Admin password is required for Terraform.")
+    print("  This will NOT be stored anywhere.")
+    password = getpass.getpass("  Enter pg_admin_password: ")
+    env = os.environ.copy()
+    env["TF_VAR_pg_admin_password"] = password
+
+    if action == "create":
+        print_step("Running terraform init...")
+        result = subprocess.run("terraform init", shell=True, cwd=server_path, env=env)
+        if result.returncode != 0:
+            print_error("terraform init failed.")
+            return
+
+    print_step("Running terraform plan...")
+    result = subprocess.run(
+        'terraform plan -var-file="terraform.tfvars"',
+        shell=True, cwd=server_path, env=env
+    )
+    if result.returncode != 0:
+        print_error("terraform plan failed.")
+        return
+
+    if not confirm("Plan looks good. Apply now?", default="n"):
+        print("\n  Apply cancelled. Run manually when ready:")
+        print(f"    cd environments/{environment}/{server_name}")
+        print(f"    terraform apply -var-file=\"terraform.tfvars\"")
+        return
+
+    print_step("Running terraform apply...")
+    result = subprocess.run(
+        'terraform apply -var-file="terraform.tfvars"',
+        shell=True, cwd=server_path, env=env
+    )
+    if result.returncode != 0:
+        print_error("terraform apply failed.")
+        return
+
+    print_success("Deployment complete!")
+    if action == "create":
+        print("\n  Don't forget to add the Azure resource lock:")
+        print(f"    az lock create \\")
+        print(f"      --name lock-{server_name} \\")
+        print(f"      --resource-group <your-rg> \\")
+        print(f"      --resource-type Microsoft.DBforPostgreSQL/flexibleServers \\")
+        print(f"      --resource {server_name} \\")
+        print(f"      --lock-type CanNotDelete")
+
+
+# ===========================================================================
 # GIT HELPERS
 # ===========================================================================
+
+def get_repo_root():
+    root = Path(__file__).parent.resolve()
+    if not (root / "environments").exists() or not (root / "_template").exists():
+        print_error("Could not find environments/ and _template/ in the same folder as paas-deployer.py.")
+        sys.exit(1)
+    return root
+
+
+def get_github_remote(repo_root):
+    ok, out, _ = run_command("git remote get-url origin", cwd=repo_root)
+    if not ok or not out:
+        print_error("Could not determine GitHub remote URL.")
+        sys.exit(1)
+    match = re.search(r'[:/]([^:/]+/[^/]+?)(?:\.git)?$', out)
+    if not match:
+        print_error(f"Could not parse remote URL: {out}")
+        sys.exit(1)
+    return match.group(1)
+
+
+def get_storage_account(repo_root):
+    for env_dir in (repo_root / "environments").iterdir():
+        if not env_dir.is_dir():
+            continue
+        for server_dir in env_dir.iterdir():
+            tf = server_dir / "00_global.tf"
+            if tf.exists():
+                m = re.search(r'storage_account_name\s*=\s*"([^"]+)"', tf.read_text())
+                if m:
+                    return m.group(1)
+    tf = repo_root / "_template" / "00_global.tf"
+    if tf.exists():
+        m = re.search(r'storage_account_name\s*=\s*"([^"]+)"', tf.read_text())
+        if m:
+            return m.group(1)
+    return "stttfstatesiva001"
+
 
 def git_pull(repo_root):
     print_step("Switching to main and pulling latest...")
@@ -269,7 +558,6 @@ def git_pull(repo_root):
 
 def git_create_branch(repo_root, branch_name):
     print_step(f"Creating branch: {branch_name}")
-    # Delete branch if it already exists locally
     run_command(f"git branch -D {branch_name}", cwd=repo_root)
     ok, _, err = run_command(f"git checkout -b {branch_name}", cwd=repo_root)
     if not ok:
@@ -280,16 +568,12 @@ def git_create_branch(repo_root, branch_name):
 
 def git_commit_and_push(repo_root, branch_name, message):
     print_step("Committing changes...")
-    ok, _, err = run_command("git add .", cwd=repo_root)
-    if not ok:
-        print_error(f"Git add failed: {err}")
-        sys.exit(1)
+    run_command("git add .", cwd=repo_root)
     ok, _, err = run_command(f'git commit -m "{message}"', cwd=repo_root)
     if not ok:
         print_error(f"Git commit failed: {err}")
         sys.exit(1)
     print_success("Changes committed.")
-
     print_step(f"Pushing branch: {branch_name}")
     ok, _, err = run_command(f"git push origin {branch_name}", cwd=repo_root)
     if not ok:
@@ -369,6 +653,140 @@ provider "azurerm" {{
   subscription_id = var.subscription_id
   tenant_id       = var.tenant_id
 }}
+"""
+    with open(path, "w") as f:
+        f.write(content)
+
+
+def write_main_tf(path):
+    content = """# ===========================================================================
+# This file is identical across all server instances — do not edit.
+# All values are controlled via terraform.tfvars.
+# ===========================================================================
+
+module "postgresql" {
+  source = "../../../modules/postgresql"
+
+  subscription_id = var.subscription_id
+  tenant_id       = var.tenant_id
+  environment     = var.environment
+  project         = var.project
+
+  pg_resource_group_name = var.pg_resource_group_name
+
+  vnet_name                            = var.vnet_name
+  vnet_resource_group_name             = var.vnet_resource_group_name
+  pe_subnet_name                       = var.pe_subnet_name
+  private_dns_zone_name                = var.private_dns_zone_name
+  private_dns_zone_resource_group_name = var.private_dns_zone_resource_group_name
+
+  pg_server_name       = var.pg_server_name
+  pg_version           = var.pg_version
+  pg_sku_name          = var.pg_sku_name
+  pg_storage_mb        = var.pg_storage_mb
+  pg_storage_tier      = var.pg_storage_tier
+  pg_zone              = var.pg_zone
+  pg_auto_grow_enabled = var.pg_auto_grow_enabled
+
+  pg_admin_login    = var.pg_admin_login
+  pg_admin_password = var.pg_admin_password
+
+  pg_backup_retention_days        = var.pg_backup_retention_days
+  pg_geo_redundant_backup_enabled = var.pg_geo_redundant_backup_enabled
+
+  pg_maintenance_window = var.pg_maintenance_window
+
+  pg_ha_enabled      = var.pg_ha_enabled
+  pg_ha_standby_zone = var.pg_ha_standby_zone
+
+  pg_databases = var.pg_databases
+}
+"""
+    with open(path, "w") as f:
+        f.write(content)
+
+
+def write_variables_tf(path):
+    content = """# ===========================================================================
+# This file is identical across all server instances — do not edit.
+# All values are controlled via terraform.tfvars.
+# ===========================================================================
+
+variable "subscription_id" { type = string; sensitive = true }
+variable "tenant_id"       { type = string; sensitive = true }
+variable "environment"     { type = string }
+variable "project"         { type = string }
+
+variable "pg_resource_group_name"               { type = string }
+variable "vnet_name"                            { type = string }
+variable "vnet_resource_group_name"             { type = string }
+variable "pe_subnet_name"                       { type = string }
+variable "private_dns_zone_name"                { type = string; default = "privatelink.postgres.database.azure.com" }
+variable "private_dns_zone_resource_group_name" { type = string }
+
+variable "pg_server_name"       { type = string }
+variable "pg_version"           { type = number; default = 16 }
+variable "pg_sku_name"          { type = string; default = "GP_Standard_D2ds_v5" }
+variable "pg_storage_mb"        { type = number; default = 32768 }
+variable "pg_storage_tier"      { type = string; default = null }
+variable "pg_zone"              { type = number; default = 1 }
+variable "pg_auto_grow_enabled" { type = bool;   default = false }
+
+variable "pg_admin_login"    { type = string; default = "psqladmin" }
+variable "pg_admin_password" { type = string; sensitive = true }
+
+variable "pg_backup_retention_days"        { type = number; default = 7 }
+variable "pg_geo_redundant_backup_enabled" { type = bool;   default = false }
+
+variable "pg_maintenance_window" {
+  type = object({
+    day_of_week  = number
+    start_hour   = number
+    start_minute = number
+  })
+  default = { day_of_week = 0; start_hour = 2; start_minute = 0 }
+}
+
+variable "pg_ha_enabled"      { type = bool;   default = false }
+variable "pg_ha_standby_zone" { type = number; default = 2 }
+
+variable "pg_databases" {
+  type = map(object({
+    name      = string
+    charset   = optional(string, "UTF8")
+    collation = optional(string, "en_US.utf8")
+  }))
+  default = {}
+}
+"""
+    with open(path, "w") as f:
+        f.write(content)
+
+
+def write_outputs_tf(path):
+    content = """# ===========================================================================
+# This file is identical across all server instances — do not edit.
+# ===========================================================================
+
+output "postgresql_server_id" {
+  description = "Resource ID of the PostgreSQL Flexible Server"
+  value       = module.postgresql.postgresql_server_id
+}
+
+output "postgresql_server_name" {
+  description = "Name of the PostgreSQL Flexible Server"
+  value       = module.postgresql.postgresql_server_name
+}
+
+output "resource_group_name" {
+  description = "Resource group where the server was deployed"
+  value       = module.postgresql.resource_group_name
+}
+
+output "location" {
+  description = "Azure region where the server was deployed"
+  value       = module.postgresql.location
+}
 """
     with open(path, "w") as f:
         f.write(content)
@@ -509,11 +927,7 @@ def collect_inputs(subscription_id, tenant_id, existing=None):
     data["tenant_id"]       = tenant_id
 
     print_header("Environment")
-    data["environment"] = select_option(
-        "Select environment:",
-        ENVIRONMENTS,
-        default=e.get("environment", "dta")
-    )
+    data["environment"] = select_option("Select environment:", ENVIRONMENTS, default=e.get("environment", "dta"))
 
     print_header("Project Details")
     data["project"] = validate_input(
@@ -521,100 +935,63 @@ def collect_inputs(subscription_id, tenant_id, existing=None):
         r'^[a-z][a-z0-9-]{1,18}[a-z0-9]$',
         "myapp",
         "Lowercase letters, numbers and hyphens only. 3-20 chars.",
-        default=e.get("project"),
-        min_len=3, max_len=20
+        default=e.get("project"), min_len=3, max_len=20
     )
-
     data["server_name"] = validate_input(
         "Server name (must be globally unique across all of Azure)",
         r'^[a-z][a-z0-9-]{1,61}[a-z0-9]$',
-        f"psql-{data.get('project', 'myapp')}-{data['environment']}-001",
+        f"psql-myapp-{data['environment']}-001",
         "Lowercase letters, numbers and hyphens only. 3-63 chars.",
-        default=e.get("server_name"),
-        min_len=3, max_len=63
+        default=e.get("server_name"), min_len=3, max_len=63
     )
 
     print_header("Resource Group")
     data["pg_resource_group_name"] = validate_input(
-        "Resource group name (must already exist)",
+        "Resource group name (will be created if it does not exist)",
         r'^[a-zA-Z0-9._-]{1,90}$',
         "rg-myapp-dta",
         "Letters, numbers, hyphens, underscores and periods only.",
-        default=e.get("pg_resource_group_name"),
-        min_len=1, max_len=90
+        default=e.get("pg_resource_group_name"), min_len=1, max_len=90
     )
 
     print_header("Networking")
     data["vnet_name"] = validate_input(
-        "VNet name",
+        "VNet name (will be created if it does not exist)",
         r'^[a-zA-Z0-9._-]{2,64}$',
         "vnet-shared-dta",
         "Letters, numbers, hyphens, underscores and periods only.",
-        default=e.get("vnet_name"),
-        min_len=2, max_len=64
+        default=e.get("vnet_name"), min_len=2, max_len=64
     )
-
     data["vnet_resource_group_name"] = validate_input(
-        "VNet resource group",
+        "VNet resource group (will be created if it does not exist)",
         r'^[a-zA-Z0-9._-]{1,90}$',
         "rg-network-dta",
         "Letters, numbers, hyphens, underscores and periods only.",
-        default=e.get("vnet_resource_group_name"),
-        min_len=1, max_len=90
+        default=e.get("vnet_resource_group_name"), min_len=1, max_len=90
     )
-
     data["pe_subnet_name"] = validate_input(
-        "Private endpoint subnet name",
+        "Private endpoint subnet name (will be created if it does not exist)",
         r'^[a-zA-Z0-9._-]{2,80}$',
         "snet-private-endpoints",
         "Letters, numbers, hyphens, underscores and periods only.",
-        default=e.get("pe_subnet_name"),
-        min_len=2, max_len=80
+        default=e.get("pe_subnet_name"), min_len=2, max_len=80
     )
-
     data["private_dns_zone_resource_group_name"] = validate_input(
-        "Private DNS zone resource group",
+        "Private DNS zone resource group (will be created if it does not exist)",
         r'^[a-zA-Z0-9._-]{1,90}$',
         "rg-network-dta",
         "Letters, numbers, hyphens, underscores and periods only.",
-        default=e.get("private_dns_zone_resource_group_name"),
-        min_len=1, max_len=90
+        default=e.get("private_dns_zone_resource_group_name"), min_len=1, max_len=90
     )
+    data["private_dns_zone_name"] = DNS_ZONE_NAME
 
     print_header("PostgreSQL Server")
-    data["pg_version"] = select_option(
-        "PostgreSQL version:",
-        PG_VERSIONS,
-        default=e.get("pg_version", 16)
-    )
-
-    tier = select_option(
-        "SKU tier:",
-        list(SKU_OPTIONS.keys()),
-        default="GeneralPurpose"
-    )
-    data["pg_sku_name"] = select_option(
-        "SKU size:",
-        SKU_OPTIONS[tier],
-        default=e.get("pg_sku_name")
-    )
-
-    data["pg_storage_mb"] = select_option(
-        "Storage size:",
-        STORAGE_OPTIONS,
-        default=e.get("pg_storage_mb", 32768)
-    )
-
-    data["pg_zone"] = select_option(
-        "Availability zone:",
-        ZONES,
-        default=e.get("pg_zone", 1)
-    )
-
-    data["pg_auto_grow_enabled"] = confirm(
-        "Enable storage auto-grow? (recommended for prod)",
-        default="n"
-    )
+    data["pg_version"] = select_option("PostgreSQL version:", PG_VERSIONS, default=e.get("pg_version", 16))
+    tier = select_option("SKU tier:", list(SKU_OPTIONS.keys()), default="GeneralPurpose")
+    data["pg_sku_name"] = select_option("SKU size:", SKU_OPTIONS[tier], default=e.get("pg_sku_name"))
+    data["pg_storage_mb"] = select_option("Storage size:", STORAGE_OPTIONS, default=e.get("pg_storage_mb", 32768))
+    data["pg_zone"] = select_option("Availability zone:", ZONES, default=e.get("pg_zone", 1))
+    data["pg_auto_grow_enabled"] = confirm("Enable storage auto-grow? (recommended for prod)", default="n")
 
     print_header("Administrator")
     data["pg_admin_login"] = validate_input(
@@ -622,54 +999,24 @@ def collect_inputs(subscription_id, tenant_id, existing=None):
         r'^[a-zA-Z][a-zA-Z0-9_]{1,62}$',
         "psqladmin",
         "Letters, numbers and underscores. Must start with a letter. 2-63 chars.",
-        default=e.get("pg_admin_login", "psqladmin"),
-        min_len=2, max_len=63
+        default=e.get("pg_admin_login", "psqladmin"), min_len=2, max_len=63
     )
 
     print_header("Backup")
-    data["pg_backup_retention_days"] = input_number(
-        "Backup retention days",
-        7, 35,
-        default=e.get("pg_backup_retention_days", 7)
-    )
-
-    data["pg_geo_redundant_backup_enabled"] = confirm(
-        "Enable geo-redundant backup? (recommended for prod)",
-        default="n"
-    )
+    data["pg_backup_retention_days"] = input_number("Backup retention days", 7, 35, default=e.get("pg_backup_retention_days", 7))
+    data["pg_geo_redundant_backup_enabled"] = confirm("Enable geo-redundant backup? (recommended for prod)", default="n")
 
     print_header("Maintenance Window")
-    day_name = select_option(
-        "Maintenance day:",
-        DAYS_OF_WEEK,
-        default=DAYS_OF_WEEK[e.get("maintenance_day", 0)]
-    )
-    data["maintenance_day"] = DAYS_OF_WEEK.index(day_name)
-
-    data["maintenance_hour"] = input_number(
-        "Maintenance start hour (UTC)",
-        0, 23,
-        default=e.get("maintenance_hour", 2)
-    )
-
-    data["maintenance_minute"] = select_option(
-        "Maintenance start minute:",
-        START_MINUTES,
-        default=e.get("maintenance_minute", 0)
-    )
+    day_name = select_option("Maintenance day:", DAYS_OF_WEEK, default=DAYS_OF_WEEK[e.get("maintenance_day", 0)])
+    data["maintenance_day"]    = DAYS_OF_WEEK.index(day_name)
+    data["maintenance_hour"]   = input_number("Maintenance start hour (UTC)", 0, 23, default=e.get("maintenance_hour", 2))
+    data["maintenance_minute"] = select_option("Maintenance start minute:", START_MINUTES, default=e.get("maintenance_minute", 0))
 
     print_header("High Availability")
-    data["pg_ha_enabled"] = confirm(
-        "Enable Zone-Redundant High Availability? (recommended for prod)",
-        default="n"
-    )
+    data["pg_ha_enabled"] = confirm("Enable Zone-Redundant High Availability? (recommended for prod)", default="n")
     if data["pg_ha_enabled"]:
         available_zones = [z for z in ZONES if z != data["pg_zone"]]
-        data["pg_ha_standby_zone"] = select_option(
-            "Standby availability zone (must differ from primary):",
-            available_zones,
-            default=available_zones[0]
-        )
+        data["pg_ha_standby_zone"] = select_option("Standby availability zone:", available_zones, default=available_zones[0])
     else:
         data["pg_ha_standby_zone"] = 2 if data["pg_zone"] != 2 else 3
 
@@ -713,89 +1060,6 @@ def print_summary(data):
     """)
 
 
-
-def post_merge_deploy(repo_root, server_name, environment, action):
-    """After PR merge, pull and run terraform."""
-    if action == "delete":
-        print("\n  After PR is merged, remember to:")
-        print(f"    1. Remove the Azure resource lock for {server_name}")
-        print(f"    2. cd environments/{environment}/{server_name}")
-        print(f"    3. export TF_VAR_pg_admin_password=\'YourPassword\'")
-        print(f"    4. terraform destroy -var-file=\"terraform.tfvars\"")
-        return
-
-    if not confirm("Have you merged the PR?", default="n"):
-        print("\n  Run terraform manually when ready:")
-        print(f"    cd environments/{environment}/{server_name}")
-        print(f"    export TF_VAR_pg_admin_password=\'YourPassword\'")
-        if action == "create":
-            print(f"    terraform init")
-        print(f"    terraform apply -var-file=\"terraform.tfvars\"")
-        return
-
-    print_step("Pulling merged changes from main...")
-    ok, _, err = run_command("git checkout main", cwd=repo_root)
-    if not ok:
-        print_error(f"Failed to checkout main: {err}")
-        return
-    ok, _, err = run_command("git pull origin main", cwd=repo_root)
-    if not ok:
-        print_error(f"Failed to pull: {err}")
-        return
-    print_success("Up to date with main.")
-
-    server_path = repo_root / "environments" / environment / server_name
-
-    # Set admin password
-    print("\n  Admin password is required for Terraform.")
-    print("  This will NOT be stored anywhere.")
-    import getpass
-    password = getpass.getpass("  Enter pg_admin_password: ")
-    env = os.environ.copy()
-    env["TF_VAR_pg_admin_password"] = password
-
-    if action == "create":
-        print_step("Running terraform init...")
-        result = subprocess.run("terraform init", shell=True, cwd=server_path, env=env)
-        if result.returncode != 0:
-            print_error("terraform init failed.")
-            return
-
-    print_step("Running terraform plan...")
-    result = subprocess.run(
-        f'terraform plan -var-file="terraform.tfvars"',
-        shell=True, cwd=server_path, env=env
-    )
-    if result.returncode != 0:
-        print_error("terraform plan failed.")
-        return
-
-    if not confirm("Plan looks good. Apply?", default="n"):
-        print("\n  Apply cancelled. Run manually when ready:")
-        print(f"    cd environments/{environment}/{server_name}")
-        print(f"    terraform apply -var-file=\"terraform.tfvars\"")
-        return
-
-    print_step("Running terraform apply...")
-    result = subprocess.run(
-        f'terraform apply -var-file="terraform.tfvars"',
-        shell=True, cwd=server_path, env=env
-    )
-    if result.returncode != 0:
-        print_error("terraform apply failed.")
-        return
-
-    print_success("Deployment complete!")
-    if action == "create":
-        print("\n  Don\'t forget to add the Azure resource lock:")
-        print(f"    az lock create \\")
-        print(f"      --name lock-{server_name} \\")
-        print(f"      --resource-group <your-rg> \\")
-        print(f"      --resource-type Microsoft.DBforPostgreSQL/flexibleServers \\")
-        print(f"      --resource {server_name} \\")
-        print(f"      --lock-type CanNotDelete")
-
-
 # ===========================================================================
 # FLOWS
 # ===========================================================================
@@ -813,6 +1077,11 @@ def create_server(repo_root, repo_slug):
         print("\n  Cancelled.")
         return
 
+    # Pre-flight: check and create all Azure dependencies
+    if not run_preflight_checks(data):
+        print_error("Pre-flight checks failed. Please resolve the issues and try again.")
+        return
+
     server_name = data["server_name"]
     environment = data["environment"]
     server_path = repo_root / "environments" / environment / server_name
@@ -825,17 +1094,14 @@ def create_server(repo_root, repo_slug):
     git_pull(repo_root)
     git_create_branch(repo_root, branch_name)
 
-    print_step(f"Creating server folder...")
-    shutil.copytree(repo_root / "_template", server_path)
-
+    # Create server folder with all required files
+    print_step("Creating server folder...")
+    server_path.mkdir(parents=True, exist_ok=True)
     write_global_tf(server_path / "00_global.tf", environment, server_name, storage_account)
+    write_main_tf(server_path / "main.tf")
+    write_variables_tf(server_path / "variables.tf")
+    write_outputs_tf(server_path / "outputs.tf")
     write_tfvars(server_path / "terraform.tfvars", data)
-
-    # Remove example file from instance folder
-    example = server_path / "terraform.tfvars.example"
-    if example.exists():
-        example.unlink()
-
     print_success(f"Server folder created: environments/{environment}/{server_name}")
 
     git_commit_and_push(repo_root, branch_name, f"Add {server_name} PostgreSQL server")
@@ -857,7 +1123,7 @@ def modify_server(repo_root, repo_slug):
     env, name = selected.split("/")
     server_path = repo_root / "environments" / env / name
 
-    print_step(f"Reading current configuration...")
+    print_step("Reading current configuration...")
     existing = read_existing_tfvars(server_path / "terraform.tfvars")
 
     print_header("WHAT WOULD YOU LIKE TO MODIFY?")
@@ -963,7 +1229,7 @@ def delete_server(repo_root, repo_slug):
     """)
 
     print("  To confirm, type the server name exactly:")
-    confirm_name = input(f"  Server name: ").strip()
+    confirm_name = input("  Server name: ").strip()
     if confirm_name != name:
         print_error(f"Name does not match. Expected: {name}")
         return
@@ -998,7 +1264,6 @@ def main():
   Prerequisites:
     - Logged in to Azure  : az login --tenant <id> --use-device-code
     - SSH access to GitHub: ssh -T git@github.com
-    - Terraform repo path : set TERRAFORM_REPO env var if not auto-detected
     """)
 
     repo_root = get_repo_root()
