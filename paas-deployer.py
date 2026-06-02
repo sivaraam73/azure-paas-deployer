@@ -67,28 +67,33 @@ DNS_ZONE_NAME = "privatelink.postgres.database.azure.com"
 def clear_screen():
     os.system("cls" if os.name == "nt" else "clear")
 
-
 def print_header(title):
     print("\n" + "=" * 60)
     print(f"  {title}")
     print("=" * 60)
 
-
 def print_step(msg):
     print(f"\n  -> {msg}")
-
 
 def print_success(msg):
     print(f"  [OK] {msg}")
 
-
 def print_error(msg):
     print(f"  [ERROR] {msg}")
-
 
 def print_missing(msg):
     print(f"  [MISSING] {msg}")
 
+# ===========================================================================
+# SHELL HELPER
+# ===========================================================================
+
+def run_command(cmd, cwd=None):
+    result = subprocess.run(
+        cmd, shell=True, cwd=cwd,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+    )
+    return result.returncode == 0, result.stdout.strip(), result.stderr.strip()
 
 # ===========================================================================
 # INPUT HELPERS
@@ -195,16 +200,110 @@ def collect_databases(existing=None):
 
 
 # ===========================================================================
-# AZURE CLI HELPERS
+# AZURE RESOURCE SELECTORS
+# Show existing resources, let engineer pick or enter new name
 # ===========================================================================
 
-def run_command(cmd, cwd=None):
-    result = subprocess.run(
-        cmd, shell=True, cwd=cwd,
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-    )
-    return result.returncode == 0, result.stdout.strip(), result.stderr.strip()
+def _pick_or_new(label, items, new_label, validate_fn, default=None):
+    """Generic picker: show existing items + option to create new."""
+    options = items + [f"[ {new_label} ]"]
+    print(f"\n  {label}:")
+    if items:
+        print(f"  Existing:")
+    else:
+        print(f"  None found.")
+    for i, item in enumerate(options, 1):
+        marker = " (default)" if item == default else ""
+        print(f"    {i}) {item}{marker}")
+    while True:
+        choice = input(f"  Enter choice [1-{len(options)}]: ").strip()
+        if choice == "" and default and default in items:
+            print_success(f"Using default: {default}")
+            return default
+        if not choice.isdigit() or not (1 <= int(choice) <= len(options)):
+            print_error(f"Enter a number between 1 and {len(options)}.")
+            continue
+        selected = options[int(choice) - 1]
+        if selected == f"[ {new_label} ]":
+            return validate_fn()
+        print_success(f"Selected: {selected}")
+        return selected
 
+
+def select_resource_group(label, default=None):
+    ok, out, _ = run_command('az group list --query "[].name" -o tsv')
+    items = sorted(out.strip().split("\n")) if ok and out.strip() else []
+    return _pick_or_new(
+        label, items, "Enter new resource group name",
+        lambda: validate_input(
+            "New resource group name",
+            r'^[a-zA-Z0-9._-]{1,90}$',
+            "rg-network-dta",
+            "Letters, numbers, hyphens, underscores and periods only.",
+            min_len=1, max_len=90
+        ),
+        default=default
+    )
+
+
+def select_vnet(resource_group, default=None):
+    ok, out, _ = run_command(
+        f'az network vnet list --resource-group "{resource_group}" --query "[].name" -o tsv'
+    )
+    items = sorted(out.strip().split("\n")) if ok and out.strip() else []
+    return _pick_or_new(
+        f"VNet in {resource_group}", items, "Enter new VNet name",
+        lambda: validate_input(
+            "New VNet name",
+            r'^[a-zA-Z0-9._-]{2,64}$',
+            "vnet-shared-dta",
+            "Letters, numbers, hyphens, underscores and periods only.",
+            min_len=2, max_len=64
+        ),
+        default=default
+    )
+
+
+def select_subnet(vnet_name, resource_group, default=None):
+    ok, out, _ = run_command(
+        f'az network vnet subnet list --resource-group "{resource_group}" '
+        f'--vnet-name "{vnet_name}" --query "[].name" -o tsv'
+    )
+    items = sorted(out.strip().split("\n")) if ok and out.strip() else []
+    return _pick_or_new(
+        f"Subnet in {vnet_name}", items, "Enter new subnet name",
+        lambda: validate_input(
+            "New subnet name",
+            r'^[a-zA-Z0-9._-]{2,80}$',
+            "snet-private-endpoints",
+            "Letters, numbers, hyphens, underscores and periods only.",
+            min_len=2, max_len=80
+        ),
+        default=default
+    )
+
+
+def select_location(label, default="malaysiawest"):
+    ok, out, _ = run_command(
+        'az account list-locations --query "[?metadata.regionCategory==\'Recommended\'].name" -o tsv'
+    )
+    items = sorted(out.strip().split("\n")) if ok and out.strip() else []
+    return _pick_or_new(
+        label, items, "Enter location name manually",
+        lambda: validate_input(
+            "Location name",
+            r'^[a-z][a-z0-9]+$',
+            "malaysiawest",
+            "Lowercase letters and numbers only.",
+            default=default, min_len=3, max_len=50
+        ),
+        default=default
+    )
+
+
+# ===========================================================================
+# AZURE CLI HELPERS
+# ===========================================================================
 
 def get_az_account():
     print_step("Reading Azure account details...")
@@ -225,6 +324,24 @@ def get_rg_location(resource_group):
     return out.strip() if ok else None
 
 
+def get_storage_account(repo_root):
+    for env_dir in (repo_root / "environments").iterdir():
+        if not env_dir.is_dir():
+            continue
+        for server_dir in env_dir.iterdir():
+            tf = server_dir / "00_global.tf"
+            if tf.exists():
+                m = re.search(r'storage_account_name\s*=\s*"([^"]+)"', tf.read_text())
+                if m:
+                    return m.group(1)
+    tf = repo_root / "_template" / "00_global.tf"
+    if tf.exists():
+        m = re.search(r'storage_account_name\s*=\s*"([^"]+)"', tf.read_text())
+        if m:
+            return m.group(1)
+    return "stttfstatesiva001"
+
+
 # ===========================================================================
 # PRE-FLIGHT CHECKS — check and auto-create all dependencies
 # ===========================================================================
@@ -235,18 +352,8 @@ def check_and_create_resource_group(name):
     if ok:
         print_success(f"Resource Group exists       : {name}")
         return True
-
     print_missing(f"Resource Group              : {name}")
-    print("\n  Location for new resource group:")
-    print("  Example : malaysiawest, southeastasia, eastus")
-    location = validate_input(
-        "Location",
-        r'^[a-z][a-z0-9]+$',
-        "malaysiawest",
-        "Lowercase letters and numbers only.",
-        default="malaysiawest",
-        min_len=3, max_len=50
-    )
+    location = select_location(f"Location for new resource group '{name}'")
     print_step(f"Creating Resource Group: {name}...")
     ok, _, err = run_command(f'az group create --name "{name}" --location "{location}" --output none')
     if not ok:
@@ -264,7 +371,6 @@ def check_and_create_vnet(vnet_name, resource_group):
     if ok:
         print_success(f"VNet exists                 : {vnet_name}")
         return True
-
     print_missing(f"VNet                        : {vnet_name}")
     location = get_rg_location(resource_group) or "malaysiawest"
     address_prefix = validate_input(
@@ -295,7 +401,6 @@ def check_and_create_subnet(subnet_name, vnet_name, resource_group):
     if ok:
         print_success(f"Subnet exists               : {subnet_name}")
         return True
-
     print_missing(f"Subnet                      : {subnet_name}")
     address_prefix = validate_input(
         "Subnet address prefix",
@@ -326,7 +431,6 @@ def check_and_create_dns_zone(zone_name, resource_group):
     if ok:
         print_success(f"Private DNS Zone exists     : {zone_name}")
         return True
-
     print_missing(f"Private DNS Zone            : {zone_name}")
     print_step(f"Creating Private DNS Zone: {zone_name}...")
     ok, _, err = run_command(
@@ -341,29 +445,34 @@ def check_and_create_dns_zone(zone_name, resource_group):
 
 
 def check_and_create_dns_link(zone_name, zone_rg, vnet_name, vnet_rg):
-    link_name = f"dns-link-{vnet_name}"
     print(f"  Checking DNS VNet Link      : {zone_name} -> {vnet_name}")
-
-    # Get VNet resource ID first
-    ok2, vnet_id, _ = run_command(
+    # Get VNet resource ID
+    ok, vnet_id, _ = run_command(
         f'az network vnet show --name "{vnet_name}" '
         f'--resource-group "{vnet_rg}" --query "id" -o tsv'
     )
-    if not ok2:
+    if not ok:
         print_error("Could not get VNet resource ID.")
         return False
-
-    # Check if ANY link already exists between this zone and this VNet
+    vnet_id = vnet_id.strip().lower()
+    # List all links and check if any already link to this VNet
     ok, out, _ = run_command(
         f'az network private-dns link vnet list '
         f'--resource-group "{zone_rg}" '
         f'--zone-name "{zone_name}" '
-        f'--query "[?virtualNetwork.id==\'{vnet_id}\'].name" -o tsv'
+        f'--output json'
     )
     if ok and out.strip():
-        print_success(f"DNS VNet Link exists        : {out.strip()}")
-        return True
-
+        try:
+            links = json.loads(out)
+            for link in links:
+                linked_vnet = link.get("virtualNetwork", {}).get("id", "").lower()
+                if linked_vnet == vnet_id:
+                    print_success(f"DNS VNet Link exists        : {link.get('name')}")
+                    return True
+        except Exception:
+            pass
+    link_name = f"dns-link-{vnet_name}"
     print_missing(f"DNS VNet Link               : {link_name}")
     print_step(f"Creating DNS VNet Link: {link_name}...")
     ok, _, err = run_command(
@@ -383,29 +492,21 @@ def check_and_create_dns_link(zone_name, zone_rg, vnet_name, vnet_rg):
 
 
 def run_preflight_checks(data):
-    """Check and auto-create all Azure dependencies before deploying."""
     print_header("PRE-FLIGHT DEPENDENCY CHECKS")
-
-    # Collect unique resource groups to check
     rgs = list(dict.fromkeys([
         data["pg_resource_group_name"],
         data["vnet_resource_group_name"],
         data["private_dns_zone_resource_group_name"],
     ]))
-
     for rg in rgs:
         if not check_and_create_resource_group(rg):
             return False
-
     if not check_and_create_vnet(data["vnet_name"], data["vnet_resource_group_name"]):
         return False
-
     if not check_and_create_subnet(data["pe_subnet_name"], data["vnet_name"], data["vnet_resource_group_name"]):
         return False
-
     if not check_and_create_dns_zone(DNS_ZONE_NAME, data["private_dns_zone_resource_group_name"]):
         return False
-
     if not check_and_create_dns_link(
         DNS_ZONE_NAME,
         data["private_dns_zone_resource_group_name"],
@@ -413,7 +514,6 @@ def run_preflight_checks(data):
         data["vnet_resource_group_name"]
     ):
         return False
-
     print_success("All dependencies are ready.")
     return True
 
@@ -452,7 +552,6 @@ def post_merge_deploy(repo_root, server_name, environment, action):
     print_success("Up to date with main.")
 
     server_path = repo_root / "environments" / environment / server_name
-
     print("\n  Admin password is required for Terraform.")
     print("  This will NOT be stored anywhere.")
     password = getpass.getpass("  Enter pg_admin_password: ")
@@ -523,24 +622,6 @@ def get_github_remote(repo_root):
         print_error(f"Could not parse remote URL: {out}")
         sys.exit(1)
     return match.group(1)
-
-
-def get_storage_account(repo_root):
-    for env_dir in (repo_root / "environments").iterdir():
-        if not env_dir.is_dir():
-            continue
-        for server_dir in env_dir.iterdir():
-            tf = server_dir / "00_global.tf"
-            if tf.exists():
-                m = re.search(r'storage_account_name\s*=\s*"([^"]+)"', tf.read_text())
-                if m:
-                    return m.group(1)
-    tf = repo_root / "_template" / "00_global.tf"
-    if tf.exists():
-        m = re.search(r'storage_account_name\s*=\s*"([^"]+)"', tf.read_text())
-        if m:
-            return m.group(1)
-    return "stttfstatesiva001"
 
 
 def git_pull(repo_root):
@@ -709,7 +790,6 @@ module "postgresql" {
 def write_variables_tf(path):
     content = """# ===========================================================================
 # This file is identical across all server instances — do not edit.
-# All values are controlled via terraform.tfvars.
 # ===========================================================================
 
 variable "subscription_id" { type = string; sensitive = true }
@@ -927,7 +1007,9 @@ def collect_inputs(subscription_id, tenant_id, existing=None):
     data["tenant_id"]       = tenant_id
 
     print_header("Environment")
-    data["environment"] = select_option("Select environment:", ENVIRONMENTS, default=e.get("environment", "dta"))
+    data["environment"] = select_option(
+        "Select environment:", ENVIRONMENTS, default=e.get("environment", "dta")
+    )
 
     print_header("Project Details")
     data["project"] = validate_input(
@@ -940,58 +1022,56 @@ def collect_inputs(subscription_id, tenant_id, existing=None):
     data["server_name"] = validate_input(
         "Server name (must be globally unique across all of Azure)",
         r'^[a-z][a-z0-9-]{1,61}[a-z0-9]$',
-        f"psql-myapp-{data['environment']}-001",
+        f"psql-myapp-{data.get('environment','dta')}-001",
         "Lowercase letters, numbers and hyphens only. 3-63 chars.",
         default=e.get("server_name"), min_len=3, max_len=63
     )
 
-    print_header("Resource Group")
-    data["pg_resource_group_name"] = validate_input(
-        "Resource group name (will be created if it does not exist)",
-        r'^[a-zA-Z0-9._-]{1,90}$',
-        "rg-myapp-dta",
-        "Letters, numbers, hyphens, underscores and periods only.",
-        default=e.get("pg_resource_group_name"), min_len=1, max_len=90
+    print_header("Resource Group for PostgreSQL Server")
+    data["pg_resource_group_name"] = select_resource_group(
+        "PostgreSQL server resource group (select existing or create new)",
+        default=e.get("pg_resource_group_name")
     )
 
     print_header("Networking")
-    data["vnet_name"] = validate_input(
-        "VNet name (will be created if it does not exist)",
-        r'^[a-zA-Z0-9._-]{2,64}$',
-        "vnet-shared-dta",
-        "Letters, numbers, hyphens, underscores and periods only.",
-        default=e.get("vnet_name"), min_len=2, max_len=64
+    data["vnet_resource_group_name"] = select_resource_group(
+        "VNet resource group (select existing or create new)",
+        default=e.get("vnet_resource_group_name")
     )
-    data["vnet_resource_group_name"] = validate_input(
-        "VNet resource group (will be created if it does not exist)",
-        r'^[a-zA-Z0-9._-]{1,90}$',
-        "rg-network-dta",
-        "Letters, numbers, hyphens, underscores and periods only.",
-        default=e.get("vnet_resource_group_name"), min_len=1, max_len=90
+    data["vnet_name"] = select_vnet(
+        data["vnet_resource_group_name"],
+        default=e.get("vnet_name")
     )
-    data["pe_subnet_name"] = validate_input(
-        "Private endpoint subnet name (will be created if it does not exist)",
-        r'^[a-zA-Z0-9._-]{2,80}$',
-        "snet-private-endpoints",
-        "Letters, numbers, hyphens, underscores and periods only.",
-        default=e.get("pe_subnet_name"), min_len=2, max_len=80
+    data["pe_subnet_name"] = select_subnet(
+        data["vnet_name"],
+        data["vnet_resource_group_name"],
+        default=e.get("pe_subnet_name")
     )
-    data["private_dns_zone_resource_group_name"] = validate_input(
-        "Private DNS zone resource group (will be created if it does not exist)",
-        r'^[a-zA-Z0-9._-]{1,90}$',
-        "rg-network-dta",
-        "Letters, numbers, hyphens, underscores and periods only.",
-        default=e.get("private_dns_zone_resource_group_name"), min_len=1, max_len=90
+    data["private_dns_zone_resource_group_name"] = select_resource_group(
+        "Private DNS zone resource group (select existing or create new)",
+        default=e.get("private_dns_zone_resource_group_name")
     )
     data["private_dns_zone_name"] = DNS_ZONE_NAME
 
     print_header("PostgreSQL Server")
-    data["pg_version"] = select_option("PostgreSQL version:", PG_VERSIONS, default=e.get("pg_version", 16))
-    tier = select_option("SKU tier:", list(SKU_OPTIONS.keys()), default="GeneralPurpose")
-    data["pg_sku_name"] = select_option("SKU size:", SKU_OPTIONS[tier], default=e.get("pg_sku_name"))
-    data["pg_storage_mb"] = select_option("Storage size:", STORAGE_OPTIONS, default=e.get("pg_storage_mb", 32768))
-    data["pg_zone"] = select_option("Availability zone:", ZONES, default=e.get("pg_zone", 1))
-    data["pg_auto_grow_enabled"] = confirm("Enable storage auto-grow? (recommended for prod)", default="n")
+    data["pg_version"] = select_option(
+        "PostgreSQL version:", PG_VERSIONS, default=e.get("pg_version", 16)
+    )
+    tier = select_option(
+        "SKU tier:", list(SKU_OPTIONS.keys()), default="GeneralPurpose"
+    )
+    data["pg_sku_name"] = select_option(
+        "SKU size:", SKU_OPTIONS[tier], default=e.get("pg_sku_name")
+    )
+    data["pg_storage_mb"] = select_option(
+        "Storage size:", STORAGE_OPTIONS, default=e.get("pg_storage_mb", 32768)
+    )
+    data["pg_zone"] = select_option(
+        "Availability zone:", ZONES, default=e.get("pg_zone", 1)
+    )
+    data["pg_auto_grow_enabled"] = confirm(
+        "Enable storage auto-grow? (recommended for prod)", default="n"
+    )
 
     print_header("Administrator")
     data["pg_admin_login"] = validate_input(
@@ -1003,20 +1083,35 @@ def collect_inputs(subscription_id, tenant_id, existing=None):
     )
 
     print_header("Backup")
-    data["pg_backup_retention_days"] = input_number("Backup retention days", 7, 35, default=e.get("pg_backup_retention_days", 7))
-    data["pg_geo_redundant_backup_enabled"] = confirm("Enable geo-redundant backup? (recommended for prod)", default="n")
+    data["pg_backup_retention_days"] = input_number(
+        "Backup retention days", 7, 35, default=e.get("pg_backup_retention_days", 7)
+    )
+    data["pg_geo_redundant_backup_enabled"] = confirm(
+        "Enable geo-redundant backup? (recommended for prod)", default="n"
+    )
 
     print_header("Maintenance Window")
-    day_name = select_option("Maintenance day:", DAYS_OF_WEEK, default=DAYS_OF_WEEK[e.get("maintenance_day", 0)])
+    day_name = select_option(
+        "Maintenance day:", DAYS_OF_WEEK,
+        default=DAYS_OF_WEEK[e.get("maintenance_day", 0)]
+    )
     data["maintenance_day"]    = DAYS_OF_WEEK.index(day_name)
-    data["maintenance_hour"]   = input_number("Maintenance start hour (UTC)", 0, 23, default=e.get("maintenance_hour", 2))
-    data["maintenance_minute"] = select_option("Maintenance start minute:", START_MINUTES, default=e.get("maintenance_minute", 0))
+    data["maintenance_hour"]   = input_number(
+        "Maintenance start hour (UTC)", 0, 23, default=e.get("maintenance_hour", 2)
+    )
+    data["maintenance_minute"] = select_option(
+        "Maintenance start minute:", START_MINUTES, default=e.get("maintenance_minute", 0)
+    )
 
     print_header("High Availability")
-    data["pg_ha_enabled"] = confirm("Enable Zone-Redundant High Availability? (recommended for prod)", default="n")
+    data["pg_ha_enabled"] = confirm(
+        "Enable Zone-Redundant High Availability? (recommended for prod)", default="n"
+    )
     if data["pg_ha_enabled"]:
         available_zones = [z for z in ZONES if z != data["pg_zone"]]
-        data["pg_ha_standby_zone"] = select_option("Standby availability zone:", available_zones, default=available_zones[0])
+        data["pg_ha_standby_zone"] = select_option(
+            "Standby availability zone:", available_zones, default=available_zones[0]
+        )
     else:
         data["pg_ha_standby_zone"] = 2 if data["pg_zone"] != 2 else 3
 
@@ -1034,9 +1129,11 @@ def print_summary(data):
   Server name     : {data['server_name']}
 
   Resource Group  : {data['pg_resource_group_name']}
-  VNet            : {data['vnet_name']} ({data['vnet_resource_group_name']})
+  VNet RG         : {data['vnet_resource_group_name']}
+  VNet            : {data['vnet_name']}
   PE Subnet       : {data['pe_subnet_name']}
   DNS Zone RG     : {data['private_dns_zone_resource_group_name']}
+  DNS Zone        : {data['private_dns_zone_name']}
 
   PG Version      : {data['pg_version']}
   SKU             : {data['pg_sku_name']}
@@ -1077,7 +1174,6 @@ def create_server(repo_root, repo_slug):
         print("\n  Cancelled.")
         return
 
-    # Pre-flight: check and create all Azure dependencies
     if not run_preflight_checks(data):
         print_error("Pre-flight checks failed. Please resolve the issues and try again.")
         return
@@ -1094,7 +1190,6 @@ def create_server(repo_root, repo_slug):
     git_pull(repo_root)
     git_create_branch(repo_root, branch_name)
 
-    # Create server folder with all required files
     print_step("Creating server folder...")
     server_path.mkdir(parents=True, exist_ok=True)
     write_global_tf(server_path / "00_global.tf", environment, server_name, storage_account)
